@@ -220,20 +220,25 @@ class PlannerLogger(gym.Wrapper):
 
 
 class StreamingVideoRecorder(gym.Wrapper):
-    """Record one mp4 per run by streaming frames into an ffmpeg subprocess.
+    """Record one mp4 per human-render camera by streaming frames into an
+    ffmpeg subprocess each (video_<camera>.mp4).
 
     Replaces RecordEpisode(save_video=True) for video-only recording: upstream
     holds every rendered frame in RAM until the episode ends (~12 GB at the
     2048x2048 render resolution); here each frame goes straight to ffmpeg's
     stdin, so memory stays at a single frame no matter the episode length.
+    All cameras are rendered in one pass per step (scene.update_render +
+    get_human_render_camera_images), then each image is piped to its own
+    ffmpeg.
     """
 
-    def __init__(self, env, output_dir, video_fps=30, video_name="video.mp4"):
+    def __init__(self, env, output_dir, video_fps=30):
         super().__init__(env)
-        self.output_path = Path(output_dir) / video_name
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.video_fps = video_fps
-        self._proc = None
-        self._disabled = False
+        self._procs: dict[str, subprocess.Popen] = {}
+        self._disabled: set[str] = set()
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -249,38 +254,54 @@ class StreamingVideoRecorder(gym.Wrapper):
         return super().close()
 
     def _write_frame(self):
-        if self._disabled:
-            return
-        img = common.to_numpy(self.env.render())
-        if img.ndim == 4:
-            if img.shape[0] != 1:
-                raise ValueError("StreamingVideoRecorder supports num_envs=1 only")
-            img = img[0]
-        if self._proc is None:
-            self._start(img.shape[0], img.shape[1])
-        try:
-            self._proc.stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
-        except BrokenPipeError:
-            print("[StreamingVideoRecorder] ffmpeg exited, disabling video recording")
-            self._proc = None
-            self._disabled = True
+        env = self.env.unwrapped
+        for obj in env._hidden_objects:
+            obj.show_visual()
+        env.scene.update_render(update_sensors=False, update_human_render_cameras=True)
+        render_images = env.scene.get_human_render_camera_images()
+        for obj in env._hidden_objects:
+            obj.hide_visual()
+        for name, img in render_images.items():
+            if name in self._disabled:
+                continue
+            img = common.to_numpy(img)
+            if img.ndim < 3 or img.size == 0:
+                # e.g. render_mode="human" produces no offscreen images; skip
+                continue
+            if img.ndim == 4:
+                if img.shape[0] != 1:
+                    raise ValueError("StreamingVideoRecorder supports num_envs=1 only")
+                img = img[0]
+            proc = self._procs.get(name)
+            if proc is None:
+                proc = self._start(name, img.shape[0], img.shape[1])
+                self._procs[name] = proc
+            try:
+                proc.stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
+            except BrokenPipeError:
+                print(f"[StreamingVideoRecorder] ffmpeg exited for camera '{name}', "
+                      "disabling its video recording")
+                self._procs.pop(name, None)
+                self._disabled.add(name)
 
-    def _start(self, height, width):
+    def _start(self, name, height, width):
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{width}x{height}", "-r", str(self.video_fps),
             "-i", "-",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            str(self.output_path),
+            str(self.output_dir / f"video_{name}.mp4"),
         ]
-        self._proc = subprocess.Popen(
+        return subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
     def _finalize(self):
-        if self._proc is None:
-            return
-        self._proc.stdin.close()
-        self._proc.wait()
-        self._proc = None
+        for name, proc in self._procs.items():
+            try:
+                proc.stdin.close()
+                proc.wait()
+            except Exception:
+                pass
+        self._procs = {}

@@ -119,9 +119,37 @@ class BaseRoboCasaSimple(BaseRoboCasaScene):
         agent_pos = self.agent.robot.pose.p[0]
         agent_pos[0] = pos[0]
         agent_pos[1] = pos[1]
-        q = degree_to_quanterion(z=int(self._main_rng.uniform(0, 360)))
+        q = degree_to_quanterion(z=int(self._sample_spawn_yaw(pos)))
         self.agent_pose = Pose.create_from_pq(p=agent_pos, q=q)
         self.agent.robot.set_pose(self.agent_pose)
+
+    def _sample_spawn_yaw(self, pos):
+        """Sample a spawn yaw so the straight arm's gripper (1.13 m forward)
+        spawns over the OPEN FLOOR, south of the counter - a random yaw can
+        aim the arm over the counter and the gripper spawns INSIDE the
+        fixtures (a stuck initial pose; verified: seeds 9/17 - the gripper
+        against the oven door / over the stove, failing every drive)."""
+        x0, y0 = pos
+        r = 1.13
+        fb = self.floor_bounds
+        front = self.counter_pos[1] - self.counter_size[1] / 2 - 0.10
+        cand = np.arange(0, 360, 2)
+        tx = x0 + r * np.cos(np.deg2rad(cand))
+        ty = y0 + r * np.sin(np.deg2rad(cand))
+        ok = (
+            (tx >= fb[0] + 0.10) & (tx <= fb[1] - 0.10)
+            & (ty >= fb[2] + 0.10) & (ty <= front - 0.05)
+        )
+        feasible = cand[ok]
+        # draw the SAME uniform(0,360) the old code did FIRST - this keeps
+        # the RNG stream (and every seed's object layout) identical to the
+        # pre-fix runs; the draw is then remapped into the feasible arc
+        # deterministically
+        u = float(self._main_rng.uniform(0, 360))
+        if len(feasible):
+            idx = min(int((u / 360.0) * len(feasible)), len(feasible) - 1)
+            return int(feasible[idx])
+        return int(u)
 
     # ------------------------------------------------------------------ #
     # Usable area on the main counter

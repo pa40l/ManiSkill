@@ -17,8 +17,7 @@ from mani_skill.examples.motionplanning.fetch.extand import (
 from mani_skill.examples.motionplanning.fetch.utils import (
     compute_box_grasp_thin_side_info,
 )
-from mani_skill.utils.wrappers.record import RecordEpisode
-from utils.logging_utils import PlannerLogger, capture_stdout
+from utils.logging_utils import PlannerLogger, StreamingVideoRecorder, capture_stdout
 from utils.planners_utils import (
     lower_torso_smooth,
     retract_arm_lift_torso,
@@ -215,13 +214,10 @@ if __name__ == "__main__":
         robot_uids="ds_fetch",
         control_mode="pd_joint_pos",
     )
-    env = RecordEpisode(
-        env,
-        output_dir=str(run_dir),
-        save_video=True,
-        video_fps=30,
-        save_on_reset=True,
-    )
+    # Video-only recording: frames stream straight into ffmpeg, so RAM stays at
+    # a single frame instead of RecordEpisode's whole-episode frame buffer
+    # (~12 GB at the 2048x2048 render resolution).
+    env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
     env = PlannerLogger(env, log_dir=run_dir, name=f"myrobocasa_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):

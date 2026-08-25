@@ -1,10 +1,12 @@
 ---
-name: maniskill-planner-analisis
+name: maniskill-planner-analysis
 description: Automates the evaluation and failure diagnostics of the ManiSkill motion planner. Executes multi-seed motion planning benchmarks, orchestrates sub-agents to analyze individual failure logs via a dedicated log-analysis skill, and aggregates all sub-agent findings into a comprehensive diagnostic report with high-level resolution strategies.
+---
 
 # ManiSkill Motion Planner Failure Analysis Skill
 
 ## Inputs
+
 * `planner`: Name of the ManiSkill planner to evaluate.
 * `num_runs`: Total number of seeds/episodes to run.
 
@@ -13,11 +15,13 @@ description: Automates the evaluation and failure diagnostics of the ManiSkill m
 ## Execution Workflow
 
 ### Step 1: Execute Benchmark Suite
+
 Execute the multi-seed benchmark script to generate execution traces across distinct scenes/seeds.
 
 1. Run the benchmark controller:
+
    ```bash
-   ./analyze.sh {planner} {num_runs}
+   scripts/analyze.sh {planner} {num_runs}
    ```
 
 2. Parse the output summary to extract pathes to logs with failed planners.
@@ -29,7 +33,7 @@ Execute the multi-seed benchmark script to generate execution traces across dist
 For every identified failure directory:
 
 1. Spawn a dedicated sub-agent for the individual failed seed.
-2. Instruct the sub-agent to invoke the **maniskill-log-analisis** targeting path to log with failed planner.
+2. Instruct the sub-agent to invoke the **maniskill-logs-analysis** skill targeting the path to the failed run's log.
 
 ---
 

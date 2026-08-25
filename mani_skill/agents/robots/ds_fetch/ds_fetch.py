@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import sapien
@@ -15,7 +16,10 @@ from mani_skill.utils.structs import Pose
 @register_agent()
 class DSFetch(Fetch):
     uid = "ds_fetch"
-    urdf_path = f"/home/jezv/Projects/ManiSkill/mani_skill/examples/motionplanning/fetch/fetch.urdf"
+    # Resolve relative to the repo root so this works from any checkout (local, gangway, worktree).
+    urdf_path: str = str(
+        Path(__file__).resolve().parents[4] / "mani_skill/examples/motionplanning/fetch/fetch.urdf"
+    )
 
     @property
     def _sensor_configs(self):
@@ -209,10 +213,10 @@ class DSFetch(Fetch):
         # -------------------------------------------------------------------------- #
         # Base
         # -------------------------------------------------------------------------- #
-        base_pd_joint_vel = PDBaseForwardVelControllerConfig(
+        base_pd_joint_vel = PDBaseVelControllerConfig(
             self.base_joint_names,
-            lower=[-1, -3.14],
-            upper=[1, 3.14],
+            lower=[-1, -1, -3.14],
+            upper=[1, 1, 3.14],
             damping=1000,
             force_limit=500,
             normalize_action=True,

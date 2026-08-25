@@ -1205,11 +1205,11 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
                 self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
             )
             body_action[0] = body_action[1] = 0.0
-            base_action = np.array([0.0, 0.0])
+            base_action = np.array([0.0, 0.0, 0.0])
 
             qvel = result["velocity"][min(i, n_step - 1)]
 
-            base_action[1] = qvel[2]
+            base_action[2] = qvel[2]
 
             action = np.hstack(
                 [arm_action, self.gripper_state, body_action, base_action]
@@ -1245,13 +1245,20 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
                 self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
             )
             body_action[0] = body_action[1] = 0.0
-            base_action = np.array([0.0, 0.0])
-
+            # holonomic base: convert the plan's ROOT-frame x/y joint
+            # velocities into the EGO frame of the vel controller
+            # ([vx_fwd, vy_left, w_yaw]); no forward-only projection, so the
+            # lateral component of the plan is executed instead of dropped
             qvel = result["velocity"][min(i, n_step - 1)]
-            base_vel = np.array([qvel[0], qvel[1], 0.0])
-            base_vel_wrt_world = root_to_world @ base_vel
-            is_forward = np.dot(base_vel_wrt_world, base_direction)
-            base_action[0] = is_forward
+            yaw_j = float(
+                self.env_agent.robot.get_qpos().cpu().numpy()[0][2]
+            )
+            cy, sy = np.cos(yaw_j), np.sin(yaw_j)
+            base_action = np.array(
+                [cy * qvel[0] + sy * qvel[1],
+                 -sy * qvel[0] + cy * qvel[1],
+                 0.0]
+            )
 
             action = np.hstack(
                 [arm_action, self.gripper_state, body_action, base_action]
@@ -1317,12 +1324,18 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
             root_to_world = (
                 self.env_agent.robot.root_pose.sp.to_transformation_matrix()[:3, :3]
             )
-            base_vel = np.array([qvel[0], qvel[1], 0.0])
-            base_vel_wrt_world = root_to_world @ base_vel
-            is_forward = np.dot(base_vel_wrt_world, base_direction)
-
-            base_action = np.array([0.0, 0.0])
-            base_action[0] = is_forward
+            # holonomic base: convert the plan's ROOT-frame x/y joint
+            # velocities into the EGO frame of the vel controller; execute the
+            # FULL plan velocity (including lateral) instead of dropping it
+            yaw_j = float(
+                self.env_agent.robot.get_qpos().cpu().numpy()[0][2]
+            )
+            cy, sy = np.cos(yaw_j), np.sin(yaw_j)
+            base_action = np.array(
+                [cy * qvel[0] + sy * qvel[1],
+                 -sy * qvel[0] + cy * qvel[1],
+                 0.0]
+            )
 
             action = np.hstack(
                 [arm_action, self.gripper_state, body_action, base_action]
@@ -1376,7 +1389,7 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
                 ]
                 body_action[0] = body_action[1] = 0.0
 
-                base_action = np.array([0.0, 0.0])
+                base_action = np.array([0.0, 0.0, 0.0])
 
                 last_lift_poses.append(
                     self.env_agent.controller.controllers["body"]
@@ -1471,7 +1484,7 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
         body_action = (
             self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
         )
-        base_action = np.array([0, 0])
+        base_action = np.array([0, 0, 0])
 
         for i in range(t):
             if self.control_mode == "pd_joint_pos":
@@ -1502,7 +1515,7 @@ class FetchMotionPlanningSapienSolver(PandaArmMotionPlanningSapienSolver):
         body_action = (
             self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
         )
-        base_action = np.array([0, 0])
+        base_action = np.array([0, 0, 0])
         for i in range(t):
             if self.control_mode == "pd_joint_pos":
                 # action = np.hstack([arm_action, self.gripper_state, body_action, base_vel])
