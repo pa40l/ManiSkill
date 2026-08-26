@@ -23,14 +23,14 @@ Rendering is by far the biggest CPU cost; for large batches (10+ workers) run vi
 NO_VIDEO=1 bash "$SCRIPT" {planner} {num_runs} {workers}
 ```
 
-## Re-record failed seeds with video
+## Failed-seed videos: on demand by subagents
 
-After the batch, re-run the **failed** seeds **locally with video** in the background (only the few failed seeds, so the render cost is fine) and keep their mp4s for the final analysis step.
+Do **not** re-run all failed seeds locally upfront — re-rendering every failed seed costs about as much as the batch itself. Instead, let the analysis subagents decide (per `maniskill-planner-analysis`): a subagent locally re-runs **a specific** failed seed **with video only when the video is actually needed** to confirm an anomaly, watches the resulting mp4, and reports.
 
-**Local runs are single-worker only**: one seed at a time, no parallel batch — local rendering is CPU-heavy and parallel would just contend. Run each failed seed as its own background process:
+This overrides the read-only rule of `maniskill-logs-analysis` for exactly this case: rerun is allowed on demand, not as a mass pre-pass. Local re-runs stay **single-worker** (one seed, no parallel batch):
 
 ```bash
-uv run python -m planners.{planner} --seed {failed_seed} &
+uv run python -m planners.{planner} --seed {failed_seed}
 ```
 
-Wait for them at the end; the video-correlation step of the analysis (per `maniskill-logs-analysis`) uses these mp4s to visually confirm the anomalies found in the event/CSV logs.
+The subagent then inspects `logs/<run>/video_*.mp4` around the flagged steps.
