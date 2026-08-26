@@ -71,18 +71,19 @@ rsync -rltz --no-perms --no-owner --no-group \
     exit 1
   }
 
-# The scenes read assets from <repo>/mani_skill/assets; the remote clone
-# already has the full data dir, so just symlink it into the cache (NFS).
-ssh "${REMOTE_HOST}" "ln -sfn ${REMOTE_REPO}/mani_skill/assets ${SRC_DIR}/mani_skill/assets" >/dev/null 2>&1 ||
-  {
-    echo "!! could not symlink assets into cache"
-    exit 1
-  }
-
 # Instantiate the run dir as hardlinks from the cache: no per-run data transfer.
 ssh "${REMOTE_HOST}" "cp -al ${SRC_DIR}/. ${RUNDIR}/ >/dev/null 2>&1 || cp -a ${SRC_DIR}/. ${RUNDIR}/ >/dev/null 2>&1" ||
   {
     echo "!! could not seed run dir from cache"
+    exit 1
+  }
+
+# Scenes read assets from <repo>/mani_skill/assets; the remote clone already
+# has the full data dir, so symlink it into this run dir (NFS) -- a hardlink on
+# the symlink itself is rejected as cross-device, hence it is done per run dir.
+ssh "${REMOTE_HOST}" "ln -sfn ${REMOTE_REPO}/mani_skill/assets ${RUNDIR}/mani_skill/assets" >/dev/null 2>&1 ||
+  {
+    echo "!! could not symlink assets into run dir"
     exit 1
   }
 
