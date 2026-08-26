@@ -87,16 +87,30 @@ ssh "${REMOTE_HOST}" "ln -sfn ${REMOTE_REPO}/mani_skill/assets ${RUNDIR}/mani_sk
     exit 1
   }
 
-# Run seeds in parallel with ONE ssh connection: the parallelism is spawned
-# INSIDE the remote host (xargs -P on gangway). N concurrent ssh tunnels through
-# the bastion jump host get dropped with "Connection closed by UNKNOWN port
-# 65535" (roughly half the workers fail), while a single tunnel survives
-# arbitrary worker counts. Idle-marker options keep the one tunnel alive
-# through long runs.
-ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=12 "$REMOTE_HOST" \
-  "cd ${RUNDIR} && seq 1 ${SEED_COUNT} | xargs -P ${WORKERS} -I{} env PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed {} ${PLANNER_ARGS} >/dev/null 2>&1"
-# xargs exits 123 if any seed crashed; that is not fatal (failures are judged
-# by the events below), so ignore the exit status.
+# Launch the workers DETACHED on the remote (short ssh): a long-lived worker
+# ssh idles while seeds run (all output goes to /dev/null) and the bastion
+# tunnel drops it, killing the seeds with SIGHUP. A short launch ssh plus
+# short polling ssh sessions survives the flaky tunnel.
+ssh -o BatchMode=yes "${REMOTE_HOST}" \
+  "cd ${RUNDIR} && setsid bash -c 'seq 1 ${SEED_COUNT} | xargs -P ${WORKERS} -I{} env PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed {} ${PLANNER_ARGS} >/dev/null 2>&1' >/dev/null 2>&1 & echo started" ||
+  {
+    echo "!! could not launch workers on remote"
+    exit 1
+  }
+
+# Poll with short ssh sessions until all seed workers finished.
+echo "==> waiting for ${SEED_COUNT} seeds (workers=${WORKERS})"
+deadline=$(( $(date +%s) + 5400 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  n=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE_HOST}" \
+        "pgrep -fc 'planners\\.${PLANNER_NAME}' " 2>/dev/null || true)
+  n=${n:-0}
+  if [ "${n}" -le 0 ]; then
+    break
+  fi
+  sleep 15
+done
+echo "==> workers done (or deadline reached)"
 
 # Alternative (only if one-ssh-per-worker is ever needed again): ssh ControlMaster
 # multiplexing in ~/.ssh/config for Host gangway, so parallel sessions share one
