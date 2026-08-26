@@ -55,13 +55,15 @@ ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR}" ||
     exit 1
   }
 
-# Push the whole local working tree (incl. uncommitted edits) into the cache.
-# - excludes mani_skill/assets (huge, needed only on the local machine): the
-#   remote keeps its own assets in ~/.maniskill
+# Push only what the planners need: code + configs. Everything else (archives,
+# videos, docs, assets) is local-only weight -- the remote keeps its own assets
+# in ~/.maniskill.
 # - -z: the bastion tunnel is ~0.7 MB/s, compression pays off on text code
 rsync -rltz --no-perms --no-owner --no-group \
   --exclude '.venv' --exclude 'logs' --exclude '.git' --exclude '.pi' --exclude '__pycache__' \
-  --exclude 'mani_skill/assets' \
+  --exclude 'logs_archive_old' --exclude 'videos' --exclude 'figures' --exclude 'docs' \
+  --exclude 'mshab' --exclude 'examples' --exclude 'assets' \
+  --exclude 'mani_skill/assets' --exclude '*.pyc' --exclude '*.ipynb' \
   ./ "${REMOTE_HOST}:${SRC_DIR}/" >/dev/null 2>&1 ||
   {
     echo "!! rsync to remote failed"
