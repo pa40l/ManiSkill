@@ -14,3 +14,13 @@ Rendering is by far the biggest CPU cost; for large batches (10+ workers) run vi
 ```bash
 NO_VIDEO=1 scripts/remote_analyze.sh {planner} {num_runs} {workers}
 ```
+
+## Re-record failed seeds with video
+
+After the batch, re-run the **failed** seeds **locally with video** in the background (only the few failed seeds, so the render cost is fine) and keep their mp4s for the final analysis step:
+
+```bash
+uv run python -m planners.{planner} --seed {failed_seed} &
+```
+
+Wait for them at the end; the video-correlation step of the analysis (per `maniskill-logs-analysis`) uses these mp4s to visually confirm the anomalies found in the event/CSV logs.
