@@ -5,18 +5,22 @@ description: Runs the ManiSkill planner benchmark remotely on gangway (ssh) with
 
 Read **maniskill-planner-analysis**, but run the benchmark with this script instead of its local one.
 
-**Where the script is** — do not hunt for it:
-- The repository has a root-level alias (a tracked symlink): `scripts/remote_analyze.sh`. Run it from the repo root / worktree root.
-- If the alias is missing, resolve it from this skill's `location` in the available-skills list: `<skill-location>/scripts/remote_analyze.sh`.
+**Where the script is** — do not hunt for it. Resolve it once (works from any directory inside this repo/worktree):
 
 ```bash
-scripts/remote_analyze.sh {planner} {num_runs} {workers}
+SCRIPT=$(find "$(git rev-parse --show-toplevel)/skills" -name remote_analyze.sh | head -1)
+```
+
+Then run the benchmark with it:
+
+```bash
+bash "$SCRIPT" {planner} {num_runs} {workers}
 ```
 
 Rendering is by far the biggest CPU cost; for large batches (10+ workers) run video-less:
 
 ```bash
-NO_VIDEO=1 scripts/remote_analyze.sh {planner} {num_runs} {workers}
+NO_VIDEO=1 bash "$SCRIPT" {planner} {num_runs} {workers}
 ```
 
 ## Re-record failed seeds with video

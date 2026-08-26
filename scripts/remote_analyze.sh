@@ -1,1 +1,0 @@
-../skills/maniskill-remote-planner-analysis/scripts/remote_analyze.sh
