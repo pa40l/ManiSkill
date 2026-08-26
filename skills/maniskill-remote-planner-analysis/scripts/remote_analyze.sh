@@ -60,13 +60,20 @@ rsync -rlt --no-perms --no-owner --no-group \
     exit 1
   }
 
-# Run seeds in parallel: each worker is one ssh landing a single remote process.
-export SEED_COUNT WORKERS PLANNER_NAME REMOTE_HOST RUNDIR VENV_PY PLANNER_ARGS
-seq 1 "$SEED_COUNT" | xargs -P "$WORKERS" -n1 bash -c '
-  seed="$1"
-  ssh -o BatchMode=yes "$REMOTE_HOST" \
-    "cd ${RUNDIR} && PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed ${seed} ${PLANNER_ARGS} >/dev/null 2>&1"
-' _
+# Run seeds in parallel with ONE ssh connection: the parallelism is spawned
+# INSIDE the remote host (xargs -P on gangway). N concurrent ssh tunnels through
+# the bastion jump host get dropped with "Connection closed by UNKNOWN port
+# 65535" (roughly half the workers fail), while a single tunnel survives
+# arbitrary worker counts. Idle-marker options keep the one tunnel alive
+# through long runs.
+ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=12 "$REMOTE_HOST" \
+  "cd ${RUNDIR} && seq 1 ${SEED_COUNT} | xargs -P ${WORKERS} -I{} env PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed {} ${PLANNER_ARGS} >/dev/null 2>&1"
+# xargs exits 123 if any seed crashed; that is not fatal (failures are judged
+# by the events below), so ignore the exit status.
+
+# Alternative (only if one-ssh-per-worker is ever needed again): ssh ControlMaster
+# multiplexing in ~/.ssh/config for Host gangway, so parallel sessions share one
+# bastion tunnel instead of each opening its own.
 
 echo "==> pull logs back -> ./logs/"
 rsync -rlt --no-perms --no-owner --no-group "${REMOTE_HOST}:${RUNDIR}/logs/" ./logs/ >/dev/null 2>&1
