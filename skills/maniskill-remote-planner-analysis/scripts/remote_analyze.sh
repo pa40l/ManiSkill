@@ -61,10 +61,10 @@ ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR} && rm -f ${SRC_DIR}/mani_ski
 # data dir is symlinked below instead of being transferred.
 # - -z: the bastion tunnel is ~0.7 MB/s, compression pays off on text code
 rsync -rltz --no-perms --no-owner --no-group \
-  --exclude '.venv' --exclude 'logs' --exclude '.git' --exclude '.pi' --exclude '__pycache__' \
-  --exclude 'logs_archive_old' --exclude 'videos' --exclude 'figures' --exclude 'docs' \
-  --exclude 'mshab' --exclude 'examples' \
-  --exclude 'mani_skill/assets' --exclude '*.pyc' --exclude '*.ipynb' \
+  --exclude '/.venv' --exclude '/.git' --exclude '/.pi' --exclude '/logs' --exclude '/__pycache__' \
+  --exclude '/logs_archive_old' --exclude '/videos' --exclude '/figures' --exclude '/docs' \
+  --exclude '/mshab' --exclude '/examples' \
+  --exclude '__pycache__' --exclude '*.pyc' --exclude '*.ipynb' --exclude 'mani_skill/assets' \
   ./ "${REMOTE_HOST}:${SRC_DIR}/" >/dev/null 2>&1 ||
   {
     echo "!! rsync to remote failed"
