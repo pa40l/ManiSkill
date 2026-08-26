@@ -33,6 +33,9 @@ fi
 
 JOB="gw-$(date +%Y%m%d_%H%M%S)"
 RUNDIR="~/gw-runs/${JOB}"
+# Persistent cache mirror: rsync is delta-incremental into it, then each run
+# dir is instantiated as hardlinks (cp -al) — no full ~800 MB transfer per run.
+SRC_DIR="~/gw-runs/src"
 VENV_PY="${REMOTE_REPO}/.venv/bin/python"
 # NO_VIDEO=1 appends --no-video to every remote planner run (no render, much faster).
 PLANNER_ARGS=""
@@ -44,19 +47,31 @@ fi
 echo "==> sync working tree -> ${REMOTE_HOST}:${RUNDIR} (workers=${WORKERS})"
 THRESHOLD_START=$(date +%s)
 
-# Isolated remote run dir: a git worktree of the remote clone (shares its .git).
-ssh "${REMOTE_HOST}" "git -C ${REMOTE_REPO} worktree add --detach ${RUNDIR} HEAD >/dev/null 2>&1 || (rm -rf ${RUNDIR} && mkdir -p ${RUNDIR})" ||
+# Isolated remote run dir (no git worktree needed: content is fully seeded
+# from the cache mirror, so a plain dir is enough and much cheaper).
+ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR}" ||
   {
-    echo "!! could not create remote worktree"
+    echo "!! could not create remote run dir"
     exit 1
   }
 
-# Push the whole local working tree (incl. uncommitted edits) into the run dir.
-rsync -rlt --no-perms --no-owner --no-group \
+# Push the whole local working tree (incl. uncommitted edits) into the cache.
+# - excludes mani_skill/assets (huge, needed only on the local machine): the
+#   remote keeps its own assets in ~/.maniskill
+# - -z: the bastion tunnel is ~0.7 MB/s, compression pays off on text code
+rsync -rltz --no-perms --no-owner --no-group \
   --exclude '.venv' --exclude 'logs' --exclude '.git' --exclude '.pi' --exclude '__pycache__' \
-  ./ "${REMOTE_HOST}:${RUNDIR}/" >/dev/null 2>&1 ||
+  --exclude 'mani_skill/assets' \
+  ./ "${REMOTE_HOST}:${SRC_DIR}/" >/dev/null 2>&1 ||
   {
     echo "!! rsync to remote failed"
+    exit 1
+  }
+
+# Instantiate the run dir as hardlinks from the cache: no per-run data transfer.
+ssh "${REMOTE_HOST}" "cp -al ${SRC_DIR}/. ${RUNDIR}/ >/dev/null 2>&1 || cp -a ${SRC_DIR}/. ${RUNDIR}/ >/dev/null 2>&1" ||
+  {
+    echo "!! could not seed run dir from cache"
     exit 1
   }
 
@@ -88,6 +103,7 @@ find ./logs -maxdepth 2 -type f -name '*_events.jsonl' -newermt "@${THRESHOLD_ST
     fi
   done | sort -u
 
-# Clean up the remote run dir (logs already pulled).
-ssh "${REMOTE_HOST}" "git -C ${REMOTE_REPO} worktree remove --force ${RUNDIR} >/dev/null 2>&1; rm -rf ${RUNDIR}" >/dev/null 2>&1
+# Clean up the remote run dir (logs already pulled); the cache mirror stays
+# so the next run's rsync is delta-only.
+ssh "${REMOTE_HOST}" "rm -rf ${RUNDIR}" >/dev/null 2>&1
 echo "==> done"
