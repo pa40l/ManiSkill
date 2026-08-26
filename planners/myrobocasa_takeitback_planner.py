@@ -62,6 +62,11 @@ def parse_args():
     parser.add_argument("--info", action="store_true", help="Print environment info in planner")
     parser.add_argument("--log-dir", type=str, default="logs", help="Directory for log output (default: logs)")
     parser.add_argument("--log-freq", type=int, default=10, help="Write trajectory rows every N steps (default: 10)")
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable mp4 video recording (skip StreamingVideoRecorder: no render, faster)",
+    )
     return parser.parse_args()
 
 
@@ -939,11 +944,15 @@ if __name__ == "__main__":
     # Video-only recording: frames stream straight into ffmpeg, so RAM stays at
     # a single frame instead of RecordEpisode's whole-episode frame buffer
     # (~12 GB at the 2048x2048 render resolution).
-    env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
+    if args.no_video:
+        print("[INFO] video recording disabled (--no-video)")
+    else:
+        env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
     env = PlannerLogger(env, log_dir=run_dir, name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
 
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):
         planning(env, SEED, debug=args.debug, info=args.info)
     env.close()
-    print(f"[INFO] Video recording saved in '{run_dir}/'")
+    if not args.no_video:
+        print(f"[INFO] Video recording saved in '{run_dir}/'")

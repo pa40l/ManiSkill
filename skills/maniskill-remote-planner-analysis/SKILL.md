@@ -8,3 +8,9 @@ Read **maniskill-planner-analysis**, but run the benchmark with this script inst
 ```bash
 scripts/remote_analyze.sh {planner} {num_runs} {workers}
 ```
+
+Rendering is by far the biggest CPU cost; for large batches (10+ workers) run video-less:
+
+```bash
+NO_VIDEO=1 scripts/remote_analyze.sh {planner} {num_runs} {workers}
+```
