@@ -5,6 +5,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,7 +69,11 @@ def capture_stdout(output_path=None):
     later inspection. stderr is left untouched so real errors stay visible.
     """
     path = output_path if output_path is not None else os.devnull
-    with open(path, "w") as sink, contextlib.redirect_stdout(sink):
+    try:
+        sink = open(path, "w")
+    except OSError as e:
+        raise OSError(f"cannot open {path} for console log: {e}") from e
+    with sink, contextlib.redirect_stdout(sink):
         yield
 
 
@@ -94,9 +100,20 @@ class PlannerLogger(gym.Wrapper):
         self.dir = Path(run_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.name = name
-        self.log_freq = max(1, int(log_freq or 1))
+        try:
+            self.log_freq = max(1, int(log_freq or 1))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"invalid log_freq {log_freq!r}") from e
         self._step = 0
-        self._events_f = open(self.dir / f"{name}_events.jsonl", "w", encoding="utf-8")
+        # Flush the event log in batches instead of per event: per-event flush()
+        # from W parallel workers is a metadata storm on NFS. 64 events is well
+        # under a second of planner output, so nothing observable is lost.
+        self._events_written = 0
+        self._flush_every = 64
+        try:
+            self._events_f = open(self.dir / f"{name}_events.jsonl", "w", encoding="utf-8")
+        except OSError as e:
+            raise OSError(f"cannot create event log in {self.dir}: {e}") from e
         self._objs = {}  # name -> open csv file handle
 
     # --- public API -----------------------------------------------------
@@ -108,7 +125,10 @@ class PlannerLogger(gym.Wrapper):
         if name in self._objs:
             return
         path = self.dir / f"{name}_trajectory.csv"
-        f = open(path, "w", encoding="utf-8")
+        try:
+            f = open(path, "w", encoding="utf-8")
+        except OSError as e:
+            raise OSError(f"cannot create trajectory log {path}: {e}") from e
         f.write("step,x,y,z,qx,qy,qz,qw\n")
         self._objs[name] = (handle, f)
         self._write_row(name)  # starting pose
@@ -123,7 +143,9 @@ class PlannerLogger(gym.Wrapper):
         }
         rec.update(extra)
         self._events_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._events_f.flush()
+        self._events_written += 1
+        if self._events_written % self._flush_every == 0:
+            self._events_f.flush()
         return rec
 
     def log_motion(self, stage, fn, *args, **kwargs):
@@ -148,7 +170,7 @@ class PlannerLogger(gym.Wrapper):
             s = ln.strip()
             if s and (re.search(r"fail|stuck|not reach|unreachable", s, re.I) or (re.search(r"\bik\b", s, re.I) and not re.search(r"\b(results|solution)\b", s, re.I))):
                 hits.append(s)
-        if hits or (isinstance(result, (int, float)) and int(result) == -1):
+        if hits or (isinstance(result, (int, float)) and result == -1):
             detail = " | ".join(dict.fromkeys(hits)) or f"plan failed (returned {result})"
             self.log_event("error", f"{stage} failed", detail=detail)
         return result
@@ -220,16 +242,21 @@ class PlannerLogger(gym.Wrapper):
 
 
 class StreamingVideoRecorder(gym.Wrapper):
-    """Record one mp4 per human-render camera by streaming frames into an
-    ffmpeg subprocess each (video_<camera>.mp4).
+    """Record one mp4 per human-render camera, buffering the encoded stream in
+    RAM and writing each mp4 to disk ONCE at the end.
 
-    Replaces RecordEpisode(save_video=True) for video-only recording: upstream
-    holds every rendered frame in RAM until the episode ends (~12 GB at the
-    2048x2048 render resolution); here each frame goes straight to ffmpeg's
-    stdin, so memory stays at a single frame no matter the episode length.
-    All cameras are rendered in one pass per step (scene.update_render +
-    get_human_render_camera_images), then each image is piped to its own
-    ffmpeg.
+    Frames are piped into one ffmpeg per camera (libx264, same settings as
+    before), but ffmpeg writes to its stdout (fragmented mp4, pipe-safe)
+    instead of straight to the output file. The encoded bytes are drained into
+    an in-memory buffer during the run and flushed to
+    ``<output_dir>/video_<camera>.mp4`` in a single sequential write on
+    finalize.
+
+    This keeps the exact same encode and quality while removing the per-frame
+    NFS write storm that backpressured the sim (75 concurrent streams at 25
+    workers): NFS now sees one sequential write per camera at the end. RAM cost
+    is the *compressed* stream (~0.1-0.3 GB per worker), not the raw frames
+    that RecordEpisode holds in memory.
     """
 
     def __init__(self, env, output_dir, video_fps=30):
@@ -238,6 +265,8 @@ class StreamingVideoRecorder(gym.Wrapper):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.video_fps = video_fps
         self._procs: dict[str, subprocess.Popen] = {}
+        self._bufs: dict[str, io.BytesIO] = {}
+        self._threads: dict[str, threading.Thread] = {}
         self._disabled: set[str] = set()
 
     def step(self, action):
@@ -276,13 +305,23 @@ class StreamingVideoRecorder(gym.Wrapper):
             if proc is None:
                 proc = self._start(name, img.shape[0], img.shape[1])
                 self._procs[name] = proc
+            stdin = proc.stdin
+            if stdin is None:
+                self._disabled.add(name)
+                continue
             try:
-                proc.stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
+                stdin.write(np.ascontiguousarray(img, dtype=np.uint8).tobytes())
             except BrokenPipeError:
                 print(f"[StreamingVideoRecorder] ffmpeg exited for camera '{name}', "
                       "disabling its video recording")
                 self._procs.pop(name, None)
+                self._bufs.pop(name, None)
+                self._threads.pop(name, None)
                 self._disabled.add(name)
+                continue
+            # The ffmpeg stdout is drained continuously by a background thread
+            # (started in _start), so ffmpeg never blocks on its own stdout and
+            # always consumes our stdin: no pipe deadlock.
 
     def _start(self, name, height, width):
         cmd = [
@@ -291,17 +330,85 @@ class StreamingVideoRecorder(gym.Wrapper):
             "-s", f"{width}x{height}", "-r", str(self.video_fps),
             "-i", "-",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            str(self.output_dir / f"video_{name}.mp4"),
+            "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
         ]
-        return subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
+        stdout = proc.stdout
+        if stdout is None:
+            raise RuntimeError(f"ffmpeg for '{name}' has no stdout pipe")
+        buf = io.BytesIO()
+        self._bufs[name] = buf
+        # A dedicated daemon thread drains ffmpeg's stdout into the RAM buffer.
+        # This guarantees ffmpeg never wedges on a full stdout pipe while we
+        # block on stdin.write (the classic two-pipe deadlock: we wait to write
+        # stdin, ffmpeg waits to write stdout because nobody drains it).
+        t = threading.Thread(target=self._drain_loop, args=(name, proc, buf), daemon=True, name=f"ffmpeg-drain-{name}")
+        t.start()
+        self._threads[name] = t
+        return proc
+
+    def _drain_loop(self, name, proc, buf):
+        """Continuously move ffmpeg's stdout into the RAM buffer until EOF.
+
+        Runs on its own thread; blocks on stdin-close/EOF only of this thread.
+        """
+        stdout = proc.stdout
+        if stdout is None:
+            return
+        try:
+            while True:
+                chunk = stdout.read(1 << 20)
+                if not chunk:
+                    break
+                buf.write(chunk)
+        except (ValueError, OSError):
+            pass
 
     def _finalize(self):
+        # Close stdin ends so ffmpeg hits EOF and drains its output for good.
+        for name, proc in self._procs.items():
+            stdin = proc.stdin
+            if stdin is not None:
+                stdin.close()
+        for name, proc in self._procs.items():
+            stdout = proc.stdout
+            buf = self._bufs.get(name)
+            if stdout is not None and buf is not None:
+                pass
+        # Let the drain threads hit EOF (ffmpeg closes stdout after stdin EOF)
+        # and the children exit; then collect what they wrote.
+        for name, t in list(self._threads.items()):
+            t.join(timeout=30.0)
+            if t.is_alive():
+                proc = self._procs.get(name)
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    t.join(timeout=5.0)
         for name, proc in self._procs.items():
             try:
-                proc.stdin.close()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
                 proc.wait()
-            except Exception:
-                pass
+        # Single sequential write of the whole encoded stream per camera.
+        for name in list(self._procs):
+            buf = self._bufs.pop(name, None)
+            if buf is None:
+                continue
+            data = buf.getvalue()
+            if not data or not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+                continue
+            path = self.output_dir / f"video_{name}.mp4"
+            try:
+                with open(path, "wb") as f:
+                    f.write(data)
+            except OSError as e:
+                print(f"[StreamingVideoRecorder] failed to write {path}: {e}")
         self._procs = {}
+        self._bufs = {}

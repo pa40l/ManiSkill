@@ -12,6 +12,9 @@
 #   workers         how many seeds to run in parallel (1..N)
 #   remote_host     ssh alias (default: gangway)
 #   remote_repo     remote clone that holds the working .venv (default: ~/ManiSkill)
+#
+# Env: NO_VIDEO=1 appends --no-video to every remote run (skips render, ~5-10x
+# faster). Use it for any batch with workers >= 10.
 set -uo pipefail
 
 PLANNER_NAME=${1:?usage: remote_analyze.sh <planner> <seed_count> <workers> [remote_host] [remote_repo]}
@@ -31,6 +34,12 @@ fi
 JOB="gw-$(date +%Y%m%d_%H%M%S)"
 RUNDIR="~/gw-runs/${JOB}"
 VENV_PY="${REMOTE_REPO}/.venv/bin/python"
+# NO_VIDEO=1 appends --no-video to every remote planner run (no render, much faster).
+PLANNER_ARGS=""
+if [[ ${NO_VIDEO:-0} == 1 ]]; then
+  PLANNER_ARGS="--no-video"
+  echo "==> video recording disabled (--no-video)"
+fi
 
 echo "==> sync working tree -> ${REMOTE_HOST}:${RUNDIR} (workers=${WORKERS})"
 THRESHOLD_START=$(date +%s)
@@ -52,11 +61,11 @@ rsync -rlt --no-perms --no-owner --no-group \
   }
 
 # Run seeds in parallel: each worker is one ssh landing a single remote process.
-export SEED_COUNT WORKERS PLANNER_NAME REMOTE_HOST RUNDIR VENV_PY
+export SEED_COUNT WORKERS PLANNER_NAME REMOTE_HOST RUNDIR VENV_PY PLANNER_ARGS
 seq 1 "$SEED_COUNT" | xargs -P "$WORKERS" -n1 bash -c '
   seed="$1"
   ssh -o BatchMode=yes "$REMOTE_HOST" \
-    "cd ${RUNDIR} && PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed ${seed} >/dev/null 2>&1"
+    "cd ${RUNDIR} && PYTHONPATH=${RUNDIR} MS_SKIP_ASSET_DOWNLOAD_PROMPT=1 ${VENV_PY} -m planners.${PLANNER_NAME} --seed ${seed} ${PLANNER_ARGS} >/dev/null 2>&1"
 ' _
 
 echo "==> pull logs back -> ./logs/"
