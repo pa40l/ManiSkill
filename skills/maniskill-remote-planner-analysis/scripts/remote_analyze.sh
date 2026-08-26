@@ -56,8 +56,9 @@ ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR}" ||
   }
 
 # Push only what the planners need: code + configs. Everything else (archives,
-# videos, docs, assets) is local-only weight -- the remote keeps its own assets
-# in ~/.maniskill.
+# videos, docs) is local-only weight -- the remote keeps its own assets in
+# ~/.maniskill AND in its own clone at $REMOTE_REPO/mani_skill/assets, so the
+# data dir is symlinked below instead of being transferred.
 # - -z: the bastion tunnel is ~0.7 MB/s, compression pays off on text code
 rsync -rltz --no-perms --no-owner --no-group \
   --exclude '.venv' --exclude 'logs' --exclude '.git' --exclude '.pi' --exclude '__pycache__' \
@@ -67,6 +68,14 @@ rsync -rltz --no-perms --no-owner --no-group \
   ./ "${REMOTE_HOST}:${SRC_DIR}/" >/dev/null 2>&1 ||
   {
     echo "!! rsync to remote failed"
+    exit 1
+  }
+
+# The scenes read assets from <repo>/mani_skill/assets; the remote clone
+# already has the full data dir, so just symlink it into the cache (NFS).
+ssh "${REMOTE_HOST}" "ln -sfn ${REMOTE_REPO}/mani_skill/assets ${SRC_DIR}/mani_skill/assets" >/dev/null 2>&1 ||
+  {
+    echo "!! could not symlink assets into cache"
     exit 1
   }
 
