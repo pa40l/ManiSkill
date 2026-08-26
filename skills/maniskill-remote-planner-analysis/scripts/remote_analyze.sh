@@ -62,7 +62,7 @@ ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR}" ||
 rsync -rltz --no-perms --no-owner --no-group \
   --exclude '.venv' --exclude 'logs' --exclude '.git' --exclude '.pi' --exclude '__pycache__' \
   --exclude 'logs_archive_old' --exclude 'videos' --exclude 'figures' --exclude 'docs' \
-  --exclude 'mshab' --exclude 'examples' --exclude 'assets' \
+  --exclude 'mshab' --exclude 'examples' \
   --exclude 'mani_skill/assets' --exclude '*.pyc' --exclude '*.ipynb' \
   ./ "${REMOTE_HOST}:${SRC_DIR}/" >/dev/null 2>&1 ||
   {
