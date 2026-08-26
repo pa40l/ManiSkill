@@ -49,7 +49,7 @@ THRESHOLD_START=$(date +%s)
 
 # Isolated remote run dir (no git worktree needed: content is fully seeded
 # from the cache mirror, so a plain dir is enough and much cheaper).
-ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR}" ||
+ssh "${REMOTE_HOST}" "mkdir -p ${SRC_DIR} ${RUNDIR} && rm -f ${SRC_DIR}/mani_skill/assets" ||
   {
     echo "!! could not create remote run dir"
     exit 1
