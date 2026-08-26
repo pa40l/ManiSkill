@@ -25,7 +25,9 @@ NO_VIDEO=1 bash "$SCRIPT" {planner} {num_runs} {workers}
 
 ## Re-record failed seeds with video
 
-After the batch, re-run the **failed** seeds **locally with video** in the background (only the few failed seeds, so the render cost is fine) and keep their mp4s for the final analysis step:
+After the batch, re-run the **failed** seeds **locally with video** in the background (only the few failed seeds, so the render cost is fine) and keep their mp4s for the final analysis step.
+
+**Local runs are single-worker only**: one seed at a time, no parallel batch — local rendering is CPU-heavy and parallel would just contend. Run each failed seed as its own background process:
 
 ```bash
 uv run python -m planners.{planner} --seed {failed_seed} &
