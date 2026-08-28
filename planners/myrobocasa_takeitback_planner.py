@@ -155,7 +155,7 @@ def _grasp_pose(agent, obb, cup_center, ee_direction, target_closing, raise_z=0.
     if np.dot(reach_pose.p - cup_center, base_pos - cup_center) < 0:
         print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
         if force_front:
-            approaching = -approaching
+            approaching = -np.asarray(approaching, dtype=float)
             closing = closing - (approaching @ closing) * approaching
             closing = closing / np.linalg.norm(closing)
             grasp_pose = agent.build_grasp_pose(approaching, closing, obb.center_mass.copy())
@@ -193,6 +193,8 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
                       target_closing, unwenv, raises=GRASP_RAISES, back_off=0.1,
                       lift_over=0.0, use_fallback=True, allow_tray=False,
                       force_front=False):
+    from mplib.sapien_utils.conversion import convert_object_name
+
     if allow_tray:
         # the tray regrasp: the arm reaches OVER the tray to the cup; without
         # this the mplib IK rejects every candidate as a tray collision
@@ -213,8 +215,6 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
     gripper orientation (the OBB long-side axis of the round cup is
     numerically unstable and can demand an unreachable orientation). Returns
     the executed grasp pose, or None if all attempts failed."""
-    from mplib.sapien_utils.conversion import convert_object_name
-
     for attempt in range(6):
         ed = ee_direction if attempt % 2 == 0 else -ee_direction
         tc = target_closing if attempt < 2 else -target_closing
@@ -322,6 +322,7 @@ def _lift_cup(env, planner, agent, grasp_pose, offsets=LIFT_OFFSETS, cup=None):
                                  n_init_qpos=100, disable_lift_joint=False)
             if res != -1 and _tcp_at(agent, lift_pose, tol=0.04, z_only=True):
                 if cup_z0 is not None:
+                    assert cup is not None
                     cz = float(cup.pose.p[0][2])
                     tcp_p = agent.tcp.pose.p[0].cpu().numpy()
                     cup_p = cup.pose.p[0].cpu().numpy()
@@ -380,14 +381,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     unwenv: MyRoboCasaSceneTakeItBack = env.unwrapped
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
-    agent: Fetch = unwenv.agent  # must be captured AFTER the reconfigure reset
+    agent: Fetch = unwenv.agent  # type: ignore[assignment]  # captured after reconfigure reset
 
     tray_center = unwenv.tray.pose.p[0].cpu().numpy()
     init_cup = unwenv.cup_pos[0]
 
     planner = FetchMotionPlanningSapienSolver(
         env,
-        base_pose=agent.robot.pose,
+        base_pose=agent.robot.pose,  # type: ignore[arg-type]
         vis=vis,
         print_env_info=info,
         debug=debug,
@@ -509,6 +510,22 @@ def planning(env, seed, debug=False, vis=None, info=False):
         print(f"[STAGE] {name}: base ({b[0]:.3f},{b[1]:.3f}) "
               f"cup ({c[0]:.3f},{c[1]:.3f},{c[2]:.3f}) gap {tcp_cup_gap():.3f} "
               f"grasped={cup_held()}")
+
+    def retreat_open_gripper(distance=0.08):
+        """Move open fingers away from live cup along cup-to-base direction."""
+        tcp = agent.tcp.pose.p[0].cpu().numpy()
+        cup = unwenv.cup.pose.p[0].cpu().numpy()
+        base = agent.base_link.pose.p[0].cpu().numpy()
+        away = base[:2] - cup[:2]
+        norm = float(np.linalg.norm(away))
+        if norm < 1e-6:
+            return
+        target = tcp.copy()
+        target[:2] += distance * away / norm
+        env.log_motion("release retreat", planner.static_manipulation,
+                       sapien.Pose(p=target, q=agent.tcp.pose.q[0].cpu().numpy()),
+                       n_init_qpos=100, disable_lift_joint=False)
+        _sync()
 
     # ------------------------------------------------------------------ #
     # STAGE 0: raise the torso (the straight arm above the counter top),
@@ -814,6 +831,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _frac = (_i + 1) / 30
         planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)  # pyright: ignore[reportArgumentType]
     _sync()
+    retreat_open_gripper()
     # NO torso lift here: lifting the plates catches the cup's rim and drags
     # it up (measured: the cup rode up to z 1.09 with the rising plates and
     # stayed there, precariously held - the is_static latch failed). The jaw
@@ -985,6 +1003,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _frac = (_i + 1) / 30
         planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)  # pyright: ignore[reportArgumentType]
     _sync()
+    retreat_open_gripper()
     for _ in range(2500):
         env.step(np.hstack([hold_a(), planner.gripper_state, hold_b(), _base_cmd()]))
 # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
