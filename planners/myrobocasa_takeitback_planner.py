@@ -770,7 +770,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # on the tray center
     _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
     aim_tray = np.array([tray_center[0] - _off[0], tray_center[1] - _off[1]])
-    res = env.log_motion("Stage 5 drive to tray", l_drive, aim_tray, 0.10)
+    res = env.log_motion("Stage 5 drive to tray", l_drive, aim_tray, 0.04)
     # closed-loop correction: the base drives land 3-30 cm off, but the cup's
     # base must sit fully on the tray (center within ~0.105 m); re-aim at the
     # CUP's live error and re-drive up to twice
@@ -779,7 +779,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
         _aim2 = np.array([tray_center[0] - _off[0], tray_center[1] - _off[1]])
-        res = env.log_motion("Stage 5 correction", l_drive, _aim2, 0.10)
+        res = env.log_motion("Stage 5 correction", l_drive, _aim2, 0.04)
         _sync()
     if res != 0 or tcp_cup_gap() > 0.15 or float(unwenv.cup.pose.p[0][2]) < cup_z0 + 0.04:
         print("Stage 5 drive to tray failed / cup lost; aborting")
@@ -948,14 +948,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
         return success
     _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
     aim_init = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
-    res = env.log_motion("Stage 10 drive to initial", l_drive, aim_init, 0.10)
+    res = env.log_motion("Stage 10 drive to initial", l_drive, aim_init, 0.04)
     for _c in range(2):
 # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - init_cup[:2])) <= 0.06:
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
         _aim2 = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
-        res = env.log_motion("Stage 10 correction", l_drive, _aim2, 0.10)
+        res = env.log_motion("Stage 10 correction", l_drive, _aim2, 0.04)
         _sync()
     if res != 0 or tcp_cup_gap() > 0.15:
         print("Stage 10 drive to initial failed / cup lost; aborting")
