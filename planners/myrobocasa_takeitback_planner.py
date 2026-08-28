@@ -29,6 +29,12 @@ from utils.planners_utils import (
 )
 
 FINGER_LENGTH = 0.025
+# max horizontal base->cup distance at which the fallback arm re-grasp drives
+# the base so the cup is inside the arm's reachable workspace. The straight-arms
+# TCP sits ARM_OFFSET (1.128 m) north of the base but mplib's real reachable
+# horizontal is ~1.086 m, so the gripper-at-cup park (base->cup = ARM_OFFSET)
+# leaves the cup ~2-5 cm past reach on some seeds (11/32/41/47 -> "IK Failed").
+GRASP_STANDOFF = 1.00
 # lift offsets (world), tried in order: lifting straight up swings the elbow
 # into the fixture stack and the cup into the cabinet door behind the counter,
 # so prefer up + back toward the base (south)
@@ -632,28 +638,55 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # then close. Retry with height variations and re-measurement.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 3: grasp")
-    got = False
-    for attempt in range(10):
-        cc = unwenv.cup.pose.p[0].cpu().numpy()
-        raise_z = [0.02, 0.06, 0.02, 0.08, 0.04, 0.0, 0.05, 0.03, 0.07, 0.01][attempt]
-        q_now = agent.tcp.pose.q[0].cpu().numpy()
-        final = sapien.Pose(p=[cc[0], cc[1], cc[2] + raise_z], q=q_now)
-        inter = sapien.Pose(p=[cc[0], cc[1], cc[2] + raise_z + 0.05], q=q_now)
-        r1 = env.log_motion("Stage 3 align", planner.static_manipulation,
-                            inter, n_init_qpos=100, disable_lift_joint=False)
-        planner.planner.update_from_simulation()
-        r2 = -1 if r1 == -1 else env.log_motion(
-            "Stage 3 align", planner.static_manipulation, final,
-            n_init_qpos=100, disable_lift_joint=False)
-        planner.planner.update_from_simulation()
-        if r2 != -1 and _tcp_to(agent, final.p) <= 0.04:
-            planner.close_gripper()
+    def run_grasp():
+        got = False
+        for attempt in range(10):
+            cc = unwenv.cup.pose.p[0].cpu().numpy()
+            raise_z = [0.02, 0.06, 0.02, 0.08, 0.04, 0.0, 0.05, 0.03, 0.07, 0.01][attempt]
+            q_now = agent.tcp.pose.q[0].cpu().numpy()
+            final = sapien.Pose(p=[cc[0], cc[1], cc[2] + raise_z], q=q_now)
+            inter = sapien.Pose(p=[cc[0], cc[1], cc[2] + raise_z + 0.05], q=q_now)
+            r1 = env.log_motion("Stage 3 align", planner.static_manipulation,
+                                inter, n_init_qpos=100, disable_lift_joint=False)
             planner.planner.update_from_simulation()
-            if cup_held():
-                got = True
-                break
-            planner.open_gripper()
+            r2 = -1 if r1 == -1 else env.log_motion(
+                "Stage 3 align", planner.static_manipulation, final,
+                n_init_qpos=100, disable_lift_joint=False)
             planner.planner.update_from_simulation()
+            if r2 != -1 and _tcp_to(agent, final.p) <= 0.04:
+                planner.close_gripper()
+                planner.planner.update_from_simulation()
+                if cup_held():
+                    got = True
+                    break
+                planner.open_gripper()
+                planner.planner.update_from_simulation()
+        return got
+
+    def fallback_grasp():
+        # drive the base closer (arm HIGH - the mid-grasp low-torso drive near
+        # the counter fails to move the base) so the cup is inside the
+        # workspace, then re-run the arm align. Returns True if the cup is held.
+        ramp_torso(TORSO_TRANSPORT, steps=150)
+        _b = agent.base_link.pose.p[0].cpu().numpy()[:2]
+        _cc = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+        if float(np.linalg.norm(_cc - _b)) > GRASP_STANDOFF:
+            _aim = np.array([_cc[0] + 0.10, _cc[1] - GRASP_STANDOFF, 0.0])
+            env.log_motion("fallback reach", drive_base_to_position,
+                           env, planner, _aim)
+            planner.planner.update_from_simulation()
+        ramp_torso(TORSO_GRASP, steps=120)
+        return run_grasp()
+
+    got = run_grasp()
+    if not got:
+        # FALLBACK: the primary straight-arm grasp could not reach the cup - it
+        # sits just past the arm's reachable envelope (base->cup = ARM_OFFSET
+        # ~2-5 cm beyond mplib's real reach). Drive the base closer so the cup
+        # is inside the workspace, then re-run the arm align. Only fires when
+        # the primary grasp failed, so seeds that grasp fine are untouched.
+        env.log_event("phase", "Stage 3: fallback arm regrasp")
+        got = fallback_grasp()
     if not got:
         print("Grasp failed after retries; aborting")
         env.log_event("error", "Grasp failed")
@@ -671,6 +704,16 @@ def planning(env, seed, debug=False, vis=None, info=False):
     cup_z0 = float(unwenv.cup.pose.p[0][2])
     ramp_torso(TORSO_TRANSPORT, steps=150)
     cz = float(unwenv.cup.pose.p[0][2])
+    if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
+        # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - a
+        # false-positive grasp (`is_grasping` fired but the cup never clamped,
+        # slipping out on the raise) - seed 48. Instead of aborting, re-grasp
+        # (drive base closer + re-run the align) and retry the lift once.
+        env.log_event("phase", "Stage 4: re-grasp (lift detect)")
+        if fallback_grasp():
+            cup_z0 = float(unwenv.cup.pose.p[0][2])
+            ramp_torso(TORSO_TRANSPORT, steps=150)
+            cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         print(f"Lift failed (cup z {cz:.3f} vs {cup_z0 + 0.05:.3f}, "
               f"gap {tcp_cup_gap():.3f}); aborting")
@@ -784,26 +827,46 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # the previous hang from a rim-level grip) and close; if it misses,
     # re-align with the short two-step arm motion to the cup's LIVE position
     ramp_torso(TORSO_GRASP, steps=100)
-    got8 = False
-    for _a in range(3):
-        planner.close_gripper()
-        planner.planner.update_from_simulation()
-        if cup_held():
-            got8 = True
-            break
-        planner.open_gripper()
-        planner.planner.update_from_simulation()
-        cc8 = unwenv.cup.pose.p[0].cpu().numpy()
-        q8 = agent.tcp.pose.q[0].cpu().numpy()
-        fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
-        int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
-        r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
-                            n_init_qpos=100, disable_lift_joint=False)
-        planner.planner.update_from_simulation()
-        r2 = -1 if r1 == -1 else env.log_motion(
-            "Stage 8 align", planner.static_manipulation, fin8,
-            n_init_qpos=100, disable_lift_joint=False)
-        planner.planner.update_from_simulation()
+    def run_regrasp():
+        got = False
+        for _a in range(3):
+            planner.close_gripper()
+            planner.planner.update_from_simulation()
+            if cup_held():
+                got = True
+                break
+            planner.open_gripper()
+            planner.planner.update_from_simulation()
+            cc8 = unwenv.cup.pose.p[0].cpu().numpy()
+            q8 = agent.tcp.pose.q[0].cpu().numpy()
+            fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
+            int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
+            r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
+                                n_init_qpos=100, disable_lift_joint=False)
+            planner.planner.update_from_simulation()
+            r2 = -1 if r1 == -1 else env.log_motion(
+                "Stage 8 align", planner.static_manipulation, fin8,
+                n_init_qpos=100, disable_lift_joint=False)
+            planner.planner.update_from_simulation()
+        return got
+    got8 = run_regrasp()
+    if not got8:
+        # FALLBACK: the released cup settled off the tray centre, outside the
+        # reach of the tray-approach base (seeds 1/4/28). Drive the base
+        # closer to the LIVE cup (base approach), then re-run the close+align.
+        # Only fires when the primary regrasp failed, so working regrasps are
+        # untouched (RNG-neutral for them).
+        env.log_event("phase", "Stage 8: fallback regrasp (base approach)")
+        ramp_torso(TORSO_TRANSPORT, steps=150)
+        _b8 = agent.base_link.pose.p[0].cpu().numpy()[:2]
+        _cc8 = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+        if float(np.linalg.norm(_cc8 - _b8)) > GRASP_STANDOFF:
+            _aim8 = np.array([_cc8[0] + 0.10, _cc8[1] - GRASP_STANDOFF, 0.0])
+            env.log_motion("Stage 8 fallback reach", drive_base_to_position,
+                           env, planner, _aim8)
+            planner.planner.update_from_simulation()
+        ramp_torso(TORSO_GRASP, steps=120)
+        got8 = run_regrasp()
     if not got8:
         print("Regrasp failed; aborting")
         env.log_event("error", "Regrasp failed")
@@ -820,6 +883,16 @@ def planning(env, seed, debug=False, vis=None, info=False):
     cup_z0 = float(unwenv.cup.pose.p[0][2])
     ramp_torso(TORSO_TRANSPORT, steps=150)
     cz = float(unwenv.cup.pose.p[0][2])
+    if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
+        # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - the regrasp
+        # was off-centre / a rim-level grip that slipped on the lift (seed 46).
+        # Re-grasp (drive base closer + re-run the align, now with below-centre
+        # heights) and retry the lift once.
+        env.log_event("phase", "Stage 9: re-grasp (lift detect)")
+        if fallback_grasp():
+            cup_z0 = float(unwenv.cup.pose.p[0][2])
+            ramp_torso(TORSO_TRANSPORT, steps=150)
+            cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
         env.log_event("error", "Lift from tray failed")
