@@ -180,7 +180,7 @@ def _rotate_base_to(env, planner, dir_world, max_rot=300, rot_gain=1.2,
 
 def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
                            rot_gain=1.2, rot_cap=0.25, align_deg=4,
-                           y_guard=True):
+                           y_guard=True, tol=0.15):
     """Drive the base to an arbitrary floor position.
 
     Navigation primitives, verified empirically on this fork:
@@ -226,7 +226,7 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
 
     for _ in range(60):  # outer loop: rotate-cadence or screw chunk
         he, dist, base_p = heading_error()
-        if dist < 0.15:
+        if dist < tol:
             # close enough: further rotation would only slide the base (the
             # +x slide during yaw activity) and the reach re-aims from the
             # actual position anyway
@@ -273,7 +273,7 @@ def drive_base_to_position(env, planner, target_pos, chunk=0.5, max_rot=300,
             continue
         planner.planner.update_from_simulation()
     he, dist, base_p = heading_error()
-    if dist < 0.15:
+    if dist < tol:
         return 0
     print(f"[INFO] drive_base_to_position: did not converge, {dist:.2f} m from target "
           f"at {np.round(base_p, 3)}")
