@@ -392,6 +392,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         print_env_info=info,
         debug=debug,
     )
+
+    def _sync():
+        getattr(planner.planner, "update_from_simulation")()
     env.track_object(unwenv.cup, "cup")
     env.track_object(unwenv.tray, "tray")
     env.track_object(agent.tcp, "robot_tcp")
@@ -420,10 +423,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
     TORSO_LOW = 0.02        # the torso floor for the placement ramps
 
     def hold_a():
-        return agent.controller.controllers["arm"].qpos[0].cpu().numpy()
+        return getattr(agent.controller, "controllers")["arm"].qpos[0].cpu().numpy()
 
     def hold_b():
-        return agent.controller.controllers["body"].qpos[0].cpu().numpy().copy()
+        return getattr(agent.controller, "controllers")["body"].qpos[0].cpu().numpy().copy()
 
     def step_hold(torso_target=None):
         a = np.zeros(14)
@@ -444,7 +447,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             b = hold_b()
             b[2] = start + (target - start) * ((i + 1) / steps)
             env.step(np.hstack([hold_a(), planner.gripper_state, b, _base_cmd()]))
-        planner.planner.update_from_simulation()
+        _sync()
         return float(agent.tcp.pose.p[0][2])
 
     def drive_to(tgt, tol=0.04, min_improve=0.02):
@@ -489,7 +492,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             a[7] = planner.gripper_state
             a[8:11] = b
             env.step(a)
-        planner.planner.update_from_simulation()
+        _sync()
         return float(unwenv.cup.pose.p[0][2])
 
     def cup_held():
@@ -519,7 +522,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # swung 90 deg at the shoulder (pan) so it points INTO the counter
     # (north) - the arm stays straight, only the pan joint moves.
     _rotate_base_to(env, planner, np.array([1.0, 0.0, 0.0]))
-    planner.planner.update_from_simulation()
+    _sync()
     # 85 deg, NOT 90: the shoulder pan limit is +-1.6056 rad (+-92 deg), and
     # a pan pinned at exactly 90 deg leaves the IK no room to swing the arm
     # to the cup (the align failed with "IK Failed" - the pan was at the
@@ -532,7 +535,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _a = hold_a()
         _a[0] = _pan0 + (_pan1 - _pan0) * ((_i + 1) / 250)
         env.step(np.hstack([_a, planner.gripper_state, hold_b(), _base_cmd()]))
-    planner.planner.update_from_simulation()
+    _sync()
     report_stage("0 raise+align")
 
     # ------------------------------------------------------------------ #
@@ -610,7 +613,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     pre = np.array([cc[0] + 0.03, cc[1] - ARM_OFFSET + 0.03, 0.0])
     res = env.log_motion("Stage 2 pre-grasp", drive_base_to_position,
                          env, planner, pre)
-    planner.planner.update_from_simulation()
+    _sync()
     # correction loop: the screw drive lands ~15 cm off, but the arm's align
     # (pan-85, near the +-92 deg joint limit) can only cover ~8-10 cm, so
     # re-aim the base until the GRIPPER is within ~5 cm of the cup
@@ -627,7 +630,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
                           _b[1] + (_cc2[1] - 0.06 - _g[1]), 0.0])
         env.log_motion("Stage 2 correction", drive_base_to_position,
                        env, planner, _aim2)
-        planner.planner.update_from_simulation()
+        _sync()
     ramp_torso(TORSO_GRASP, steps=120)
     report_stage("2 pre-grasp")
 
@@ -648,19 +651,19 @@ def planning(env, seed, debug=False, vis=None, info=False):
             inter = sapien.Pose(p=[cc[0], cc[1], cc[2] + raise_z + 0.05], q=q_now)
             r1 = env.log_motion("Stage 3 align", planner.static_manipulation,
                                 inter, n_init_qpos=100, disable_lift_joint=False)
-            planner.planner.update_from_simulation()
+            _sync()
             r2 = -1 if r1 == -1 else env.log_motion(
                 "Stage 3 align", planner.static_manipulation, final,
                 n_init_qpos=100, disable_lift_joint=False)
-            planner.planner.update_from_simulation()
+            _sync()
             if r2 != -1 and _tcp_to(agent, final.p) <= 0.04:
                 planner.close_gripper()
-                planner.planner.update_from_simulation()
+                _sync()
                 if cup_held():
                     got = True
                     break
                 planner.open_gripper()
-                planner.planner.update_from_simulation()
+                _sync()
         return got
 
     def fallback_grasp():
@@ -672,10 +675,29 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _cc = unwenv.cup.pose.p[0].cpu().numpy()[:2]
         if float(np.linalg.norm(_cc - _b)) > GRASP_STANDOFF:
             _aim = np.array([_cc[0] + 0.10, _cc[1] - GRASP_STANDOFF, 0.0])
-            env.log_motion("fallback reach", drive_base_to_position,
-                           env, planner, _aim)
-            planner.planner.update_from_simulation()
+            env.log_motion("fallback reach", l_drive, _aim[:2], 0.04)
+            _sync()
+        # Move the base using the measured TCP/cup offset, then close from the
+        # already aligned carry orientation before attempting a new IK pose.
+        for _ in range(2):
+            tcp_xy = agent.tcp.pose.p[0].cpu().numpy()[:2]
+            cup_xy = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+            if float(np.linalg.norm(tcp_xy - cup_xy)) <= 0.05:
+                break
+            base_xy = agent.base_link.pose.p[0].cpu().numpy()[:2]
+            env.log_motion(
+                "fallback center", l_drive,
+                base_xy + cup_xy - tcp_xy, 0.04
+            )
+            _sync()
         ramp_torso(TORSO_GRASP, steps=120)
+        for _ in range(3):
+            planner.close_gripper()
+            _sync()
+            if cup_held() and tcp_cup_gap() <= 0.08:
+                return True
+            planner.open_gripper()
+            _sync()
         return run_grasp()
 
     got = run_grasp()
@@ -753,12 +775,12 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # base must sit fully on the tray (center within ~0.105 m); re-aim at the
     # CUP's live error and re-drive up to twice
     for _c in range(2):
-        if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - tray_center[:2])) <= 0.06:
+        if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - tray_center[:2])) <= 0.02:
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
         _aim2 = np.array([tray_center[0] - _off[0], tray_center[1] - _off[1]])
         res = env.log_motion("Stage 5 correction", l_drive, _aim2, 0.10)
-        planner.planner.update_from_simulation()
+        _sync()
     if res != 0 or tcp_cup_gap() > 0.15 or float(unwenv.cup.pose.p[0][2]) < cup_z0 + 0.04:
         print("Stage 5 drive to tray failed / cup lost; aborting")
         env.log_event("error", "Stage 5 drive to tray failed")
@@ -790,8 +812,8 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # free, so the cup stays put and quiet.
     for _i in range(30):
         _frac = (_i + 1) / 30
-        planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)
-    planner.planner.update_from_simulation()
+        planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)  # pyright: ignore[reportArgumentType]
+    _sync()
     # NO torso lift here: lifting the plates catches the cup's rim and drags
     # it up (measured: the cup rode up to z 1.09 with the rising plates and
     # stayed there, precariously held - the is_static latch failed). The jaw
@@ -812,7 +834,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # so wait long enough for the is_static latch
     for _ in range(2500):
         env.step(np.hstack([hold_a(), planner.gripper_state, hold_b(), _base_cmd()]))
+        # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         if (float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]) <= 0.1
+                # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
                 and float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]) <= 0.2):
             break
     unwenv.evaluate()
@@ -831,23 +855,23 @@ def planning(env, seed, debug=False, vis=None, info=False):
         got = False
         for _a in range(3):
             planner.close_gripper()
-            planner.planner.update_from_simulation()
+            _sync()
             if cup_held():
                 got = True
                 break
             planner.open_gripper()
-            planner.planner.update_from_simulation()
+            _sync()
             cc8 = unwenv.cup.pose.p[0].cpu().numpy()
             q8 = agent.tcp.pose.q[0].cpu().numpy()
             fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
             int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
             r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
                                 n_init_qpos=100, disable_lift_joint=False)
-            planner.planner.update_from_simulation()
+            _sync()
             r2 = -1 if r1 == -1 else env.log_motion(
                 "Stage 8 align", planner.static_manipulation, fin8,
                 n_init_qpos=100, disable_lift_joint=False)
-            planner.planner.update_from_simulation()
+            _sync()
         return got
     got8 = run_regrasp()
     if not got8:
@@ -860,11 +884,12 @@ def planning(env, seed, debug=False, vis=None, info=False):
         ramp_torso(TORSO_TRANSPORT, steps=150)
         _b8 = agent.base_link.pose.p[0].cpu().numpy()[:2]
         _cc8 = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         if float(np.linalg.norm(_cc8 - _b8)) > GRASP_STANDOFF:
             _aim8 = np.array([_cc8[0] + 0.10, _cc8[1] - GRASP_STANDOFF, 0.0])
             env.log_motion("Stage 8 fallback reach", drive_base_to_position,
                            env, planner, _aim8)
-            planner.planner.update_from_simulation()
+            _sync()
         ramp_torso(TORSO_GRASP, steps=120)
         got8 = run_regrasp()
     if not got8:
@@ -880,8 +905,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # STAGE 9: lift from the tray - raise the torso, verify the cup rose.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 9: lift from tray")
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     cup_z0 = float(unwenv.cup.pose.p[0][2])
     ramp_torso(TORSO_TRANSPORT, steps=150)
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - the regrasp
@@ -890,8 +917,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # heights) and retry the lift once.
         env.log_event("phase", "Stage 9: re-grasp (lift detect)")
         if fallback_grasp():
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
             cup_z0 = float(unwenv.cup.pose.p[0][2])
             ramp_torso(TORSO_TRANSPORT, steps=150)
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
             cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
@@ -921,12 +950,13 @@ def planning(env, seed, debug=False, vis=None, info=False):
     aim_init = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
     res = env.log_motion("Stage 10 drive to initial", l_drive, aim_init, 0.10)
     for _c in range(2):
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - init_cup[:2])) <= 0.06:
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
         _aim2 = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
         res = env.log_motion("Stage 10 correction", l_drive, _aim2, 0.10)
-        planner.planner.update_from_simulation()
+        _sync()
     if res != 0 or tcp_cup_gap() > 0.15:
         print("Stage 10 drive to initial failed / cup lost; aborting")
         env.log_event("error", "Stage 10 drive to initial failed")
@@ -940,6 +970,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # STAGE 11: place on the counter - lower slowly until the cup rests.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 11: lower onto counter")
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     counter_top = float(unwenv.counter_pos[2] + unwenv.counter_size[2] / 2)
     lower_torso_until_cup_rests(counter_top)
     report_stage("11 on counter")
@@ -952,13 +983,17 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # torso - the plates rise off the cup, the cup stays put and quiet
     for _i in range(30):
         _frac = (_i + 1) / 30
-        planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)
-    planner.planner.update_from_simulation()
+        planner.change_gripper_state(t=1, gripper_state=-1.0 + _frac * 1.85)  # pyright: ignore[reportArgumentType]
+    _sync()
     for _ in range(2500):
         env.step(np.hstack([hold_a(), planner.gripper_state, hold_b(), _base_cmd()]))
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         if (float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]) <= 0.1
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
                 and float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]) <= 0.2):
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
             break
+# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     _av12 = float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0])
     print(f"[INFO] stage 12 settle done, cup av={_av12:.3f} rad/s")
     report_stage("12 released")
@@ -969,8 +1004,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
     print("Success:", success,
           "| placed_on_tray:", bool(unwenv.placed_on_tray.item()),
           "| cup xy:", np.round(unwenv.cup.pose.p[0].cpu().numpy()[:2], 3),
+          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "z:", round(float(unwenv.cup.pose.p[0][2]), 3),
+          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "| v:", round(float(torch.linalg.norm(unwenv.cup.linear_velocity, dim=1)[0]), 4),
+          # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
           "av:", round(float(torch.linalg.norm(unwenv.cup.angular_velocity, dim=1)[0]), 4))
     env.log_event("result", "Task completed", success=success)
     env.reset()
@@ -1021,7 +1059,7 @@ if __name__ == "__main__":
         print("[INFO] video recording disabled (--no-video)")
     else:
         env = StreamingVideoRecorder(env, output_dir=str(run_dir), video_fps=30)
-    env = PlannerLogger(env, log_dir=run_dir, name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
+    env = PlannerLogger(env, log_dir=str(run_dir), name=f"takeitback_seed{SEED}", log_freq=args.log_freq, run_dir=run_dir)
 
     env.action_space.seed(SEED)
     with capture_stdout(env.dir / "console.log"):
