@@ -477,21 +477,6 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 return -1
         return 0
 
-    def center_held(target_xy, tol=0.035):
-        """Center held cup by measured object error, without re-planning arm."""
-        for _ in range(3):
-            cup_xy = unwenv.cup.pose.p[0].cpu().numpy()[:2]
-            error = np.asarray(target_xy, dtype=float)[:2] - cup_xy
-            if float(np.linalg.norm(error)) <= tol:
-                return 0
-            base_xy = agent.base_link.pose.p[0].cpu().numpy()[:2]
-            if drive_to(np.r_[base_xy + error, 0.0], tol=tol,
-                        min_improve=0.01) != 0:
-                return -1
-        return int(float(np.linalg.norm(
-            unwenv.cup.pose.p[0].cpu().numpy()[:2] -
-            np.asarray(target_xy, dtype=float)[:2])) > tol)
-
     def lower_torso_until_cup_rests(surface_top_z):
         """Slowly lower the torso (grasped cup descends with the jaws) until
         the cup rests on the surface below (cup z stops decreasing)."""
@@ -796,8 +781,6 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _aim2 = np.array([tray_center[0] - _off[0], tray_center[1] - _off[1]])
         res = env.log_motion("Stage 5 correction", l_drive, _aim2, 0.10)
         _sync()
-    if res == 0:
-        res = center_held(tray_center)
     if res != 0 or tcp_cup_gap() > 0.15 or float(unwenv.cup.pose.p[0][2]) < cup_z0 + 0.04:
         print("Stage 5 drive to tray failed / cup lost; aborting")
         env.log_event("error", "Stage 5 drive to tray failed")
@@ -974,8 +957,6 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _aim2 = np.array([init_cup[0] - _off[0], init_cup[1] - _off[1]])
         res = env.log_motion("Stage 10 correction", l_drive, _aim2, 0.10)
         _sync()
-    if res == 0:
-        res = center_held(init_cup)
     if res != 0 or tcp_cup_gap() > 0.15:
         print("Stage 10 drive to initial failed / cup lost; aborting")
         env.log_event("error", "Stage 10 drive to initial failed")
