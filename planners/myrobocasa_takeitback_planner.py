@@ -724,7 +724,12 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 4: lift")
     cup_z0 = float(unwenv.cup.pose.p[0][2])
-    ramp_torso(TORSO_TRANSPORT, steps=150)
+    ramp_torso(TORSO_GRASP + 0.04, steps=40)
+    probe_cz = float(unwenv.cup.pose.p[0][2])
+    if probe_cz >= cup_z0 + 0.015 and tcp_cup_gap() <= 0.12:
+        ramp_torso(TORSO_TRANSPORT, steps=110)
+    else:
+        ramp_torso(TORSO_GRASP, steps=40)
     cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - a
@@ -732,6 +737,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # slipping out on the raise) - seed 48. Instead of aborting, re-grasp
         # (drive base closer + re-run the align) and retry the lift once.
         env.log_event("phase", "Stage 4: re-grasp (lift detect)")
+        ramp_torso(TORSO_GRASP, steps=80)
         if fallback_grasp():
             cup_z0 = float(unwenv.cup.pose.p[0][2])
             ramp_torso(TORSO_TRANSPORT, steps=150)
@@ -916,6 +922,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # Re-grasp (drive base closer + re-run the align, now with below-centre
         # heights) and retry the lift once.
         env.log_event("phase", "Stage 9: re-grasp (lift detect)")
+        ramp_torso(TORSO_GRASP, steps=80)
         if fallback_grasp():
 # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
             cup_z0 = float(unwenv.cup.pose.p[0][2])
