@@ -469,11 +469,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
         aim = np.asarray(aim_xy, dtype=float)
         if abs(aim[1] - b[1]) > 0.03:
             if drive_base_to_position(env, planner,
-                                      np.array([b[0], aim[1], 0.0]), tol=tol) != 0:
+                                      np.array([b[0], aim[1], 0.0])) != 0:
                 return -1
         if abs(aim[0] - agent.base_link.pose.p[0].cpu().numpy()[0]) > 0.03:
             if drive_base_to_position(env, planner,
-                                      np.array([aim[0], aim[1], 0.0]), tol=tol) != 0:
+                                      np.array([aim[0], aim[1], 0.0])) != 0:
                 return -1
         return 0
 
