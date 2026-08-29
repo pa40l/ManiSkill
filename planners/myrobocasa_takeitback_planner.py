@@ -450,8 +450,17 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _sync()
         return float(agent.tcp.pose.p[0][2])
 
+    def ramp_arm(target, steps=120):
+        """Move arm to a joint waypoint without teleporting its target."""
+        target = np.asarray(target, dtype=float)
+        start = hold_a()
+        for i in range(steps):
+            arm = start + (target - start) * ((i + 1) / steps)
+            env.step(np.hstack([arm, planner.gripper_state, hold_b(), _base_cmd()]))
+        _sync()
+
     def drive_to(tgt, tol=0.04, min_improve=0.02):
-        """Axis-aligned base drive, holding the straight arm + current torso,
+        """Axis-aligned base drive, holding the arm + current torso,
         heading fixed north. Returns 0 on convergence (final dist < tol)."""
         return _velocity_segment(
             env, planner, np.asarray(tgt, dtype=float), hold_a(), hold_b(),
@@ -511,8 +520,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
               f"grasped={cup_held()}")
 
     # ------------------------------------------------------------------ #
-    # STAGE 0: raise the torso (the straight arm above the counter top),
-    # rotate ONCE to face north (the arm into the counter).
+    # STAGE 0: raise torso above counter, rotate ONCE to face north, then
+    # fold elbow slightly. The bent carry pose shortens the arm offset while
+    # keeping elbow and gripper above fixtures.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 0: raise torso, align along the counter")
     ramp_torso(TORSO_TRANSPORT, steps=150)
@@ -520,7 +530,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # forward/backward drives then run along the counter (left/right of the
     # countertop) and its side faces the counter. The straight arm is then
     # swung 90 deg at the shoulder (pan) so it points INTO the counter
-    # (north) - the arm stays straight, only the pan joint moves.
+    # (north), then bend the elbow in a high, compact carry pose.
     _rotate_base_to(env, planner, np.array([1.0, 0.0, 0.0]))
     _sync()
     # 85 deg, NOT 90: the shoulder pan limit is +-1.6056 rad (+-92 deg), and
@@ -536,7 +546,12 @@ def planning(env, seed, debug=False, vis=None, info=False):
         _a[0] = _pan0 + (_pan1 - _pan0) * ((_i + 1) / 250)
         env.step(np.hstack([_a, planner.gripper_state, hold_b(), _base_cmd()]))
     _sync()
-    report_stage("0 raise+align")
+    _bent_arm = hold_a()
+    _bent_arm[1] = -0.60
+    _bent_arm[3] = 1.20
+    _bent_arm[5] = -0.60
+    ramp_arm(_bent_arm)
+    report_stage("0 raise+align+bend")
 
     # ------------------------------------------------------------------ #
     # STAGE 1: drive sideways (east-west, along the counter) to the cup's x
@@ -601,16 +616,15 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 _acm.set_default_entry(convert_object_name(_act._objs[0]), True)
             except Exception:
                 pass
-    # drive with the arm HIGH (the plates 15+ cm above the cup - they cannot
-    # touch it), lower the torso to the grasp height only AFTER the base is
-    # parked (verified: drives with the plates at cup height pushed the cup
-    # 12 cm)
+    # drive with arm HIGH (the plates cannot touch cup), lower torso to grasp
+    # height only AFTER base is parked. Recompute pre-grasp from live bent-arm
+    # TCP offset; fixed straight-arm geometry is no longer valid.
     cc = unwenv.cup.pose.p[0].cpu().numpy()
-    # the gripper parks 6 cm SOUTH-EAST of the cup: the jaws' plate edges
-    # (2.6 cm deep faces) must stay clear of the cup during the drives
-    # (verified: a y-leg driving the gripper to the cup's own y caught the
-    # cup with the plate edges and knocked it over - seed 3 run).
-    pre = np.array([cc[0] + 0.03, cc[1] - ARM_OFFSET + 0.03, 0.0])
+    arm_xy = (
+        agent.tcp.pose.p[0].cpu().numpy()[:2]
+        - agent.base_link.pose.p[0].cpu().numpy()[:2]
+    )
+    pre = np.r_[cc[:2] - arm_xy, 0.0]
     res = env.log_motion("Stage 2 pre-grasp", drive_base_to_position,
                          env, planner, pre)
     _sync()
