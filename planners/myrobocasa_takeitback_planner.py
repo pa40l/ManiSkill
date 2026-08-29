@@ -470,6 +470,19 @@ def planning(env, seed, debug=False, vis=None, info=False):
             env.step(np.hstack([arm, planner.gripper_state, hold_b(), _base_cmd()]))
         _sync()
 
+    def descend_to_grasp(target_pose, xy_tol=0.05):
+        """Use torso for final vertical closure when arm IK stalls."""
+        target = np.asarray(target_pose.p, dtype=float)
+        tcp = agent.tcp.pose.p[0].cpu().numpy()
+        if np.linalg.norm(tcp[:2] - target[:2]) > xy_tol:
+            return False
+        # pi-lens-ignore: unchecked-throwing-call-python
+        drop = float(tcp[2] - target[2])
+        if drop > 0.015:
+            body_z = max(0.0, hold_b()[2] - drop)
+            ramp_torso(body_z, steps=30)
+        return _tcp_to(agent, target) <= 0.05
+
     def drive_to(tgt, tol=0.04, min_improve=0.02):
         """Axis-aligned base drive, holding the arm + current torso,
         heading fixed north. Returns 0 on convergence (final dist < tol)."""
@@ -562,9 +575,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
         env.step(np.hstack([_a, planner.gripper_state, hold_b(), _base_cmd()]))
     _sync()
     _bent_arm = hold_a()
-    _bent_arm[1] = -0.60
-    _bent_arm[3] = 1.20
-    _bent_arm[5] = -0.60
+    _bent_arm[1] = -0.40
+    _bent_arm[3] = 0.80
+    _bent_arm[5] = -0.40
     ramp_arm(_bent_arm)
     report_stage("0 raise+align+bend")
 
@@ -686,7 +699,15 @@ def planning(env, seed, debug=False, vis=None, info=False):
                 "Stage 3 align", planner.static_manipulation, final,
                 n_init_qpos=100, disable_lift_joint=False)
             _sync()
-            if r2 != -1 and _tcp_to(agent, final.p) <= 0.04:
+            aligned = r2 != -1 and _tcp_to(agent, final.p) <= 0.04
+            if not aligned:
+                cc_live = unwenv.cup.pose.p[0].cpu().numpy()
+                live_final = sapien.Pose(
+                    p=[cc_live[0], cc_live[1], cc_live[2] + raise_z],
+                    q=agent.tcp.pose.q[0].cpu().numpy(),
+                )
+                aligned = descend_to_grasp(live_final)
+            if aligned:
                 planner.close_gripper()
                 _sync()
                 if cup_held():
@@ -732,7 +753,47 @@ def planning(env, seed, debug=False, vis=None, info=False):
             _sync()
         return run_grasp()
 
+    def alternate_grasp():
+        """Try a live front-facing grasp after repeated vertical stalls."""
+        mesh = unwenv.cup.get_first_collision_mesh(to_world_frame=True)
+        if mesh is None:
+            return False
+        obb = mesh.bounding_box_oriented
+        cc = obb.center_mass.copy()
+        ed = cc - agent.tcp.pose.p[0].cpu().numpy()
+        ed[2] = 0.0
+        if np.linalg.norm(ed) < 1e-6:
+            ed = np.array([0.0, 1.0, 0.0])
+        ed /= np.linalg.norm(ed)
+        closing = np.cross(np.array([0.0, 0.0, 1.0]), ed)
+        closing /= np.linalg.norm(closing)
+        for raise_z in (0.02, 0.06, 0.04):
+            grasp_pose, reach_pose = _grasp_pose(
+                agent, obb, cc, ed, closing,
+                raise_z=raise_z, back_off=0.06, force_front=True,
+            )
+            r1 = env.log_motion(
+                "Stage 3 alternate approach", planner.static_manipulation,
+                reach_pose, n_init_qpos=100, disable_lift_joint=False,
+            )
+            _sync()
+            r2 = -1 if r1 == -1 else env.log_motion(
+                "Stage 3 alternate grasp", planner.static_manipulation,
+                grasp_pose, n_init_qpos=100, disable_lift_joint=False,
+            )
+            _sync()
+            if r2 != -1 and _tcp_at(agent, grasp_pose, tol=0.05):
+                planner.close_gripper()
+                _sync()
+                if cup_held():
+                    return True
+                planner.open_gripper()
+                _sync()
+        return False
+
     got = run_grasp()
+    if not got:
+        got = alternate_grasp()
     if not got:
         # FALLBACK: the primary straight-arm grasp could not reach the cup - it
         # sits just past the arm's reachable envelope (base->cup = ARM_OFFSET
