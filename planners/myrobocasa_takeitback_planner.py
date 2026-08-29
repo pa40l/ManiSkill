@@ -955,17 +955,43 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # still between the jaws (partial open), so the close always catches it.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 8: regrasp")
-    # lower the torso back (the plates around the cup's middle - also fixes
-    # the previous hang from a rim-level grip) and close; if it misses,
-    # re-align with the short two-step arm motion to the cup's LIVE position
-    ramp_torso(TORSO_GRASP, steps=100)
-    def run_regrasp():
-        got = False
+    # Close at release pose first. If contact is real, a short lift test
+    # proves the cup is supported before any re-localization can disturb it.
+    got8 = False
+    lifted_from_tray = False
+    # pi-lens-ignore: unchecked-throwing-call-python
+    cup_z_before_regrasp = float(unwenv.cup.pose.p[0][2])
+    planner.close_gripper()
+    _sync()
+    if cup_held():
+        tcp8 = agent.tcp.pose.p[0].cpu().numpy()
+        q8 = agent.tcp.pose.q[0].cpu().numpy()
+        lift8 = sapien.Pose(p=tcp8 + np.array([0.0, 0.0, 0.15]), q=q8)
+        r8 = env.log_motion(
+            "Stage 8 lift test", planner.static_manipulation, lift8,
+            n_init_qpos=100, disable_lift_joint=False,
+        )
+        _sync()
+        # pi-lens-ignore: unchecked-throwing-call-python
+        lifted_from_tray = (
+            r8 != -1
+            # pi-lens-ignore: unchecked-throwing-call-python
+            and float(unwenv.cup.pose.p[0][2]) >= cup_z_before_regrasp + 0.05
+            and tcp_cup_gap() <= 0.12
+        )
+        got8 = lifted_from_tray
+        if not got8:
+            planner.open_gripper()
+            _sync()
+
+    if not got8:
+        # Re-localize only after the in-place lift test fails.
+        ramp_torso(TORSO_GRASP, steps=100)
         for _a in range(3):
             planner.close_gripper()
             _sync()
             if cup_held():
-                got = True
+                got8 = True
                 break
             planner.open_gripper()
             _sync()
@@ -973,33 +999,16 @@ def planning(env, seed, debug=False, vis=None, info=False):
             q8 = agent.tcp.pose.q[0].cpu().numpy()
             fin8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.02], q=q8)
             int8 = sapien.Pose(p=[cc8[0], cc8[1], cc8[2] + 0.07], q=q8)
-            r1 = env.log_motion("Stage 8 align", planner.static_manipulation, int8,
-                                n_init_qpos=100, disable_lift_joint=False)
+            r1 = env.log_motion(
+                "Stage 8 align", planner.static_manipulation, int8,
+                n_init_qpos=100, disable_lift_joint=False,
+            )
             _sync()
             r2 = -1 if r1 == -1 else env.log_motion(
                 "Stage 8 align", planner.static_manipulation, fin8,
-                n_init_qpos=100, disable_lift_joint=False)
+                n_init_qpos=100, disable_lift_joint=False,
+            )
             _sync()
-        return got
-    got8 = run_regrasp()
-    if not got8:
-        # FALLBACK: the released cup settled off the tray centre, outside the
-        # reach of the tray-approach base (seeds 1/4/28). Drive the base
-        # closer to the LIVE cup (base approach), then re-run the close+align.
-        # Only fires when the primary regrasp failed, so working regrasps are
-        # untouched (RNG-neutral for them).
-        env.log_event("phase", "Stage 8: fallback regrasp (base approach)")
-        ramp_torso(TORSO_TRANSPORT, steps=150)
-        _b8 = agent.base_link.pose.p[0].cpu().numpy()[:2]
-        _cc8 = unwenv.cup.pose.p[0].cpu().numpy()[:2]
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-        if float(np.linalg.norm(_cc8 - _b8)) > GRASP_STANDOFF:
-            _aim8 = np.array([_cc8[0] + 0.10, _cc8[1] - GRASP_STANDOFF, 0.0])
-            env.log_motion("Stage 8 fallback reach", drive_base_to_position,
-                           env, planner, _aim8)
-            _sync()
-        ramp_torso(TORSO_GRASP, steps=120)
-        got8 = run_regrasp()
     if not got8:
         print("Regrasp failed; aborting")
         env.log_event("error", "Regrasp failed")
@@ -1010,34 +1019,34 @@ def planning(env, seed, debug=False, vis=None, info=False):
     report_stage("8 regrasped")
 
     # ------------------------------------------------------------------ #
-    # STAGE 9: lift from the tray - raise the torso, verify the cup rose.
+    # STAGE 9: lift from the tray, unless Stage 8 already proved attachment.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 9: lift from tray")
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-    cup_z0 = float(unwenv.cup.pose.p[0][2])
-    ramp_torso(TORSO_TRANSPORT, steps=150)
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-    cz = float(unwenv.cup.pose.p[0][2])
-    if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
-        # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - the regrasp
-        # was off-centre / a rim-level grip that slipped on the lift (seed 46).
-        # Re-grasp (drive base closer + re-run the align, now with below-centre
-        # heights) and retry the lift once.
-        env.log_event("phase", "Stage 9: re-grasp (lift detect)")
-        ramp_torso(TORSO_GRASP, steps=80)
-        if fallback_grasp():
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-            cup_z0 = float(unwenv.cup.pose.p[0][2])
-            ramp_torso(TORSO_TRANSPORT, steps=150)
-# pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-            cz = float(unwenv.cup.pose.p[0][2])
-    if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
-        print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
-        env.log_event("error", "Lift from tray failed")
-        success = bool(unwenv.evaluate()["success"].item())
-        env.log_event("result", "Task aborted", success=success)
-        env.reset()
-        return success
+    if lifted_from_tray:
+        # The lift test already cleared the tray; a second lift adds no signal
+        # and can turn a supported contact into a slip.
+        # pi-lens-ignore: unchecked-throwing-call-python
+        cz = float(unwenv.cup.pose.p[0][2])
+        if tcp_cup_gap() > 0.12:
+            print(f"Lift from tray failed (cup gap {tcp_cup_gap():.3f}); aborting")
+            env.log_event("error", "Lift from tray failed")
+            success = bool(unwenv.evaluate()["success"].item())
+            env.log_event("result", "Task aborted", success=success)
+            env.reset()
+            return success
+    else:
+        # pi-lens-ignore: unchecked-throwing-call-python
+        cup_z0 = float(unwenv.cup.pose.p[0][2])
+        ramp_torso(TORSO_TRANSPORT, steps=150)
+        # pi-lens-ignore: unchecked-throwing-call-python
+        cz = float(unwenv.cup.pose.p[0][2])
+        if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
+            print(f"Lift from tray failed (cup z {cz:.3f}); aborting")
+            env.log_event("error", "Lift from tray failed")
+            success = bool(unwenv.evaluate()["success"].item())
+            env.log_event("result", "Task aborted", success=success)
+            env.reset()
+            return success
     report_stage("9 lifted from tray")
 
     # ------------------------------------------------------------------ #
