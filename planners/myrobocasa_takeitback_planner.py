@@ -609,12 +609,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # counter line (y > -0.95) and must be allowed to drive away from the
     # counter first (verified: seed 9 aborted before moving - the guard fired
     # on the starting position)
-    res = env.log_motion("Stage 1 drive", drive_base_to_position,
-                         env, planner, np.array([_b1[0], south_line, 0.0]),
-                         y_guard=False)
+    res = env.log_motion(
+        "Stage 1 drive", l_drive, np.array([_b1[0], south_line])
+    )
     if res == 0:
-        res = env.log_motion("Stage 1 drive", drive_base_to_position,
-                             env, planner, np.array([cup_xy[0] - 0.15, south_line, 0.0]))
+        res = env.log_motion(
+            "Stage 1 drive", l_drive,
+            np.array([cup_xy[0] - 0.15, south_line])
+        )
     if res != 0:
         print("Stage 1 drive failed; aborting")
         env.log_event("error", "Stage 1 drive failed")
@@ -654,8 +656,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         - agent.base_link.pose.p[0].cpu().numpy()[:2]
     )
     pre = np.r_[cc[:2] - arm_xy, 0.0]
-    res = env.log_motion("Stage 2 pre-grasp", drive_base_to_position,
-                         env, planner, pre)
+    res = env.log_motion("Stage 2 pre-grasp", l_drive, pre)
     _sync()
     # correction loop: the screw drive lands ~15 cm off, but the arm's align
     # (pan-85, near the +-92 deg joint limit) can only cover ~8-10 cm, so
@@ -672,8 +673,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         # the cup ~12 cm)
         _aim2 = np.array([_b[0] + (_cc2[0] - 0.06 - _g[0]),
                           _b[1] + (_cc2[1] - 0.06 - _g[1]), 0.0])
-        env.log_motion("Stage 2 correction", drive_base_to_position,
-                       env, planner, _aim2)
+        env.log_motion("Stage 2 correction", l_drive, _aim2)
         _sync()
     ramp_torso(TORSO_GRASP, steps=120)
     report_stage("2 pre-grasp")
