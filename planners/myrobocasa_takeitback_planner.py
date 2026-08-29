@@ -2,6 +2,7 @@ import argparse
 import random
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import gymnasium as gym
 import numpy as np
@@ -155,7 +156,8 @@ def _grasp_pose(agent, obb, cup_center, ee_direction, target_closing, raise_z=0.
     if np.dot(reach_pose.p - cup_center, base_pos - cup_center) < 0:
         print("Validation failed: grasp is diametrically opposite. Flipping approaching direction...")
         if force_front:
-            approaching = -approaching
+            approaching = -np.asarray(ee_direction, dtype=float)
+            approaching /= np.linalg.norm(approaching)
             closing = closing - (approaching @ closing) * approaching
             closing = closing / np.linalg.norm(closing)
             grasp_pose = agent.build_grasp_pose(approaching, closing, obb.center_mass.copy())
@@ -185,7 +187,9 @@ def _tcp_at(agent, target_pose, tol=0.03, z_only=False):
     tcp = agent.tcp.pose.p[0].cpu().numpy()
     target = np.asarray(target_pose.p, dtype=float)
     if z_only:
+        # pi-lens-ignore: unchecked-throwing-call-python
         return float(abs(tcp[2] - target[2])) <= tol
+    # pi-lens-ignore: unchecked-throwing-call-python
     return float(np.linalg.norm(tcp - target)) <= tol
 
 
@@ -193,6 +197,8 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
                       target_closing, unwenv, raises=GRASP_RAISES, back_off=0.1,
                       lift_over=0.0, use_fallback=True, allow_tray=False,
                       force_front=False):
+    from mplib.sapien_utils.conversion import convert_object_name
+
     if allow_tray:
         # the tray regrasp: the arm reaches OVER the tray to the cup; without
         # this the mplib IK rejects every candidate as a tray collision
@@ -213,8 +219,6 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
     gripper orientation (the OBB long-side axis of the round cup is
     numerically unstable and can demand an unreachable orientation). Returns
     the executed grasp pose, or None if all attempts failed."""
-    from mplib.sapien_utils.conversion import convert_object_name
-
     for attempt in range(6):
         ed = ee_direction if attempt % 2 == 0 else -ee_direction
         tc = target_closing if attempt < 2 else -target_closing
@@ -292,12 +296,14 @@ def _reach_and_grasp(env, planner, agent, obb, cup_center, ee_direction,
 def _tcp_to(agent, point):
     """Distance from the TCP to a point (m)."""
     tcp = agent.tcp.pose.p[0].cpu().numpy()
+    # pi-lens-ignore: unchecked-throwing-call-python
     return float(np.linalg.norm(tcp - np.asarray(point, dtype=float)))
 
 
 def _base_near(env, target_xy, tol=0.2):
     """True if the base is within tol (m) of target_xy (xy only)."""
     base = env.unwrapped.agent.base_link.pose.p[0].cpu().numpy()
+    # pi-lens-ignore: unchecked-throwing-call-python
     return float(np.linalg.norm(np.asarray(target_xy, dtype=float)[:2] - base[:2])) <= tol
 
 
@@ -314,17 +320,20 @@ def _lift_cup(env, planner, agent, grasp_pose, offsets=LIFT_OFFSETS, cup=None):
     reports success even when its refinement gave up half-way, and the executed
     lift can drift laterally by several cm while the height is correct)."""
     res = -1
-    cup_z0 = float(cup.pose.p[0][2]) if cup is not None else None
+    # pi-lens-ignore: unchecked-throwing-call-python
+    cup_z0 = float(cup.pose.p[0][2]) if cup is not None else 0.0
     for _ in range(2):
         for off in offsets:
             lift_pose = sapien.Pose(grasp_pose.p + off, grasp_pose.q)
             res = env.log_motion("Lift cup", planner.static_manipulation, lift_pose,
                                  n_init_qpos=100, disable_lift_joint=False)
             if res != -1 and _tcp_at(agent, lift_pose, tol=0.04, z_only=True):
-                if cup_z0 is not None:
+                if cup is not None:
+                    # pi-lens-ignore: unchecked-throwing-call-python
                     cz = float(cup.pose.p[0][2])
                     tcp_p = agent.tcp.pose.p[0].cpu().numpy()
                     cup_p = cup.pose.p[0].cpu().numpy()
+                    # pi-lens-ignore: unchecked-throwing-call-python
                     gap = float(np.linalg.norm(tcp_p - cup_p))
                     if cz < cup_z0 + 0.10 or gap > 0.12:
                         # POST-LIFT GRASP CONDITION: the cup must have risen
@@ -362,6 +371,7 @@ def _transport_cup(env, planner, agent, aim_xy, arm_action, body_action,
         # cup would leave the base driving on with the cup behind
         tcp = agent.tcp.pose.p[0].cpu().numpy()
         cup = unwenv.cup.pose.p[0].cpu().numpy()
+        # pi-lens-ignore: unchecked-throwing-call-python
         if float(np.linalg.norm(tcp - cup)) > 0.20:
             print(f"[INFO] transport: cup lost (TCP-cup "
                   f"{np.linalg.norm(tcp - cup):.2f} m); aborting")
@@ -380,14 +390,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
 
     unwenv: MyRoboCasaSceneTakeItBack = env.unwrapped
     obs, _ = env.reset(seed=seed, options={"reconfigure": True})
-    agent: Fetch = unwenv.agent  # must be captured AFTER the reconfigure reset
+    agent: Fetch = cast(Fetch, unwenv.agent)  # captured after reconfigure reset
 
     tray_center = unwenv.tray.pose.p[0].cpu().numpy()
     init_cup = unwenv.cup_pos[0]
 
     planner = FetchMotionPlanningSapienSolver(
         env,
-        base_pose=agent.robot.pose,
+        base_pose=agent.robot.pose.sp,
         vis=vis,
         print_env_info=info,
         debug=debug,
@@ -448,6 +458,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             b[2] = start + (target - start) * ((i + 1) / steps)
             env.step(np.hstack([hold_a(), planner.gripper_state, b, _base_cmd()]))
         _sync()
+        # pi-lens-ignore: unchecked-throwing-call-python
         return float(agent.tcp.pose.p[0][2])
 
     def ramp_arm(target, steps=120):
@@ -489,8 +500,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
     def lower_torso_until_cup_rests(surface_top_z):
         """Slowly lower the torso (grasped cup descends with the jaws) until
         the cup rests on the surface below (cup z stops decreasing)."""
+        # pi-lens-ignore: unchecked-throwing-call-python
         rest_z = float(surface_top_z + unwenv.cup_half[2])
         for _ in range(300):
+            # pi-lens-ignore: unchecked-throwing-call-python
             cz = float(unwenv.cup.pose.p[0][2])
             if cz <= rest_z + 0.01:
                 break
@@ -502,6 +515,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             a[8:11] = b
             env.step(a)
         _sync()
+        # pi-lens-ignore: unchecked-throwing-call-python
         return float(unwenv.cup.pose.p[0][2])
 
     def cup_held():
@@ -510,6 +524,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     def tcp_cup_gap():
         t = agent.tcp.pose.p[0].cpu().numpy()
         c = unwenv.cup.pose.p[0].cpu().numpy()
+        # pi-lens-ignore: unchecked-throwing-call-python
         return float(np.linalg.norm(t - c))
 
     def report_stage(name):
@@ -634,6 +649,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     for _c in range(3):
         _g = agent.tcp.pose.p[0].cpu().numpy()[:2]
         _cc2 = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+        # pi-lens-ignore: unchecked-throwing-call-python
         if float(np.linalg.norm(_g - _cc2)) <= 0.05:
             break
         _b = agent.base_link.pose.p[0].cpu().numpy()[:2]
@@ -687,6 +703,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         ramp_torso(TORSO_TRANSPORT, steps=150)
         _b = agent.base_link.pose.p[0].cpu().numpy()[:2]
         _cc = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+        # pi-lens-ignore: unchecked-throwing-call-python
         if float(np.linalg.norm(_cc - _b)) > GRASP_STANDOFF:
             _aim = np.array([_cc[0] + 0.10, _cc[1] - GRASP_STANDOFF, 0.0])
             env.log_motion("fallback reach", l_drive, _aim[:2], 0.04)
@@ -696,6 +713,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
         for _ in range(2):
             tcp_xy = agent.tcp.pose.p[0].cpu().numpy()[:2]
             cup_xy = unwenv.cup.pose.p[0].cpu().numpy()[:2]
+            # pi-lens-ignore: unchecked-throwing-call-python
             if float(np.linalg.norm(tcp_xy - cup_xy)) <= 0.05:
                 break
             base_xy = agent.base_link.pose.p[0].cpu().numpy()[:2]
@@ -737,13 +755,16 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # cup rose with the jaws (>= 0.08 m) and stays near the TCP.
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 4: lift")
+    # pi-lens-ignore: unchecked-throwing-call-python
     cup_z0 = float(unwenv.cup.pose.p[0][2])
     ramp_torso(TORSO_GRASP + 0.04, steps=40)
+    # pi-lens-ignore: unchecked-throwing-call-python
     probe_cz = float(unwenv.cup.pose.p[0][2])
     if probe_cz >= cup_z0 + 0.015 and tcp_cup_gap() <= 0.12:
         ramp_torso(TORSO_TRANSPORT, steps=110)
     else:
         ramp_torso(TORSO_GRASP, steps=40)
+    # pi-lens-ignore: unchecked-throwing-call-python
     cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         # RE-GRASP FALLBACK: the cup didn't ride up with the jaws - a
@@ -753,8 +774,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
         env.log_event("phase", "Stage 4: re-grasp (lift detect)")
         ramp_torso(TORSO_GRASP, steps=80)
         if fallback_grasp():
+            # pi-lens-ignore: unchecked-throwing-call-python
             cup_z0 = float(unwenv.cup.pose.p[0][2])
             ramp_torso(TORSO_TRANSPORT, steps=150)
+            # pi-lens-ignore: unchecked-throwing-call-python
             cz = float(unwenv.cup.pose.p[0][2])
     if cz < cup_z0 + 0.05 or tcp_cup_gap() > 0.12:
         print(f"Lift failed (cup z {cz:.3f} vs {cup_z0 + 0.05:.3f}, "
@@ -778,6 +801,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # the cup's z must stay near the stage-4 reference (the arm already
     # lifted it; the back-up does not change the z - the old check compared
     # against a pre-raise reference and falsely fired after the arm lift)
+    # pi-lens-ignore: unchecked-throwing-call-python
     if res != 0 or tcp_cup_gap() > 0.15 or float(unwenv.cup.pose.p[0][2]) < cup_z0 + 0.04:
         print("Stage 5 back-up failed / cup lost; aborting")
         env.log_event("error", "Stage 5 back-up failed")
@@ -795,12 +819,14 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # base must sit fully on the tray (center within ~0.105 m); re-aim at the
     # CUP's live error and re-drive up to twice
     for _c in range(2):
+        # pi-lens-ignore: unchecked-throwing-call-python
         if float(np.linalg.norm(unwenv.cup.pose.p[0].cpu().numpy()[:2] - tray_center[:2])) <= 0.02:
             break
         _off = unwenv.cup.pose.p[0].cpu().numpy()[:2] - agent.base_link.pose.p[0].cpu().numpy()[:2]
         _aim2 = np.array([tray_center[0] - _off[0], tray_center[1] - _off[1]])
         res = env.log_motion("Stage 5 correction", l_drive, _aim2, 0.10)
         _sync()
+    # pi-lens-ignore: unchecked-throwing-call-python
     if res != 0 or tcp_cup_gap() > 0.15 or float(unwenv.cup.pose.p[0][2]) < cup_z0 + 0.04:
         print("Stage 5 drive to tray failed / cup lost; aborting")
         env.log_event("error", "Stage 5 drive to tray failed")
@@ -815,6 +841,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # tray (the cup z stops decreasing).
     # ------------------------------------------------------------------ #
     env.log_event("phase", "Stage 6: lower onto tray")
+    # pi-lens-ignore: unchecked-throwing-call-python
     tray_top = float(unwenv.tray.pose.p[0][2] + unwenv.tray_half[2])
     lower_torso_until_cup_rests(tray_top)
     report_stage("6 on tray")
