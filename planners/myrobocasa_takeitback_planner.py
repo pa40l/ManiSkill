@@ -1048,6 +1048,10 @@ def planning(env, seed, debug=False, vis=None, info=False):
             env.log_event("result", "Task aborted", success=success)
             env.reset()
             return success
+    if lifted_from_tray:
+        # Stage 8 lift used arm IK; raise torso before base return so bent
+        # forearm clears the fixture stack.
+        ramp_torso(TORSO_TRANSPORT, steps=150)
     report_stage("9 lifted from tray")
 
     # ------------------------------------------------------------------ #
