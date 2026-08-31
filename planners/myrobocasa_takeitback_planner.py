@@ -568,18 +568,15 @@ def planning(env, seed, debug=False, vis=None, info=False):
     # joint limit). 85 deg keeps the arm pointing into the counter while
     # giving the IK ~7 deg of swing room. The pan target is ramped gradually
     # so the arm swing is slow and does not shove the base.
-    _pan0 = hold_a()[0]
     _pan1 = np.deg2rad(85)
-    for _i in range(250):
-        _a = hold_a()
-        _a[0] = _pan0 + (_pan1 - _pan0) * ((_i + 1) / 250)
-        env.step(np.hstack([_a, planner.gripper_state, hold_b(), _base_cmd()]))
-    _sync()
     _bent_arm = hold_a()
+    _bent_arm[0] = _pan1
     _bent_arm[1] = -0.40
     _bent_arm[3] = 0.80
     _bent_arm[5] = -0.40
-    ramp_arm(_bent_arm)
+    # Pan and bend together: same safe high-torso corridor, one arm path
+    # instead of two sequential ramps.
+    ramp_arm(_bent_arm, steps=180)
     report_stage("0 raise+align+bend")
 
     # ------------------------------------------------------------------ #
