@@ -977,7 +977,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     if cup_held():
         tcp8 = agent.tcp.pose.p[0].cpu().numpy()
         q8 = agent.tcp.pose.q[0].cpu().numpy()
-        lift8 = sapien.Pose(p=tcp8 + np.array([0.0, 0.0, 0.10]), q=q8)
+        lift8 = sapien.Pose(p=tcp8 + np.array([0.0, 0.0, 0.08]), q=q8)
         r8 = env.log_motion(
             "Stage 8 lift test", planner.static_manipulation, lift8,
             n_init_qpos=100, disable_lift_joint=False,
