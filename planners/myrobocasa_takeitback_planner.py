@@ -522,7 +522,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
             if cz <= rest_z + 0.01:
                 break
             b = hold_b()
-            if b[2] <= 0.001:
+            if b[2] <= TORSO_LOW + 0.001:
                 # No further torso motion is possible; avoid repeating no-op
                 # steps when a held cup cannot reach the surface.
                 break
