@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 rm -rf logs/*
-NO_VIDEO=1 bash skills/maniskill-remote-planner-analysis/scripts/remote_analyze.sh myrobocasa_takeitback_planner 50 10 >/tmp/takeitback-autoresearch.out 2>&1
+NO_VIDEO=1 bash skills/maniskill-remote-planner-analysis/scripts/remote_analyze.sh myrobocasa_takeitback_planner 100 10 >/tmp/takeitback-autoresearch.out 2>&1
 uv run python - <<'PY'
 import datetime
 import glob
