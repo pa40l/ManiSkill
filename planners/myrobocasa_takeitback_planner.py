@@ -672,8 +672,9 @@ def planning(env, seed, debug=False, vis=None, info=False):
                           _b[1] + (_cc2[1] - 0.06 - _g[1]), 0.0])
         env.log_motion("Stage 2 correction", l_drive, _aim2)
         _sync()
-    ramp_torso(TORSO_GRASP, steps=120)
-    report_stage("2 pre-grasp")
+    # Leave torso high; first Stage 3 screw can lower torso and align arm in
+    # one geometry path. Failed reach falls back to the old torso ramp.
+    report_stage("2 high pre-grasp")
 
     # ------------------------------------------------------------------ #
     # STAGE 3: grasp - a SHORT two-step straight-arm motion (inter 5 cm
@@ -684,6 +685,7 @@ def planning(env, seed, debug=False, vis=None, info=False):
     env.log_event("phase", "Stage 3: grasp")
     def run_grasp():
         got = False
+        torso_ready = False
         for attempt in range(10):
             cc = unwenv.cup.pose.p[0].cpu().numpy()
             raise_z = [0.02, 0.06, 0.02, 0.08, 0.04, 0.0, 0.05, 0.03, 0.07, 0.01][attempt]
@@ -693,6 +695,13 @@ def planning(env, seed, debug=False, vis=None, info=False):
             r1 = env.log_motion("Stage 3 align", planner.static_manipulation,
                                 inter, n_init_qpos=100, disable_lift_joint=False)
             _sync()
+            if not torso_ready and (r1 == -1 or not _tcp_at(agent, inter, tol=0.05)):
+                # The high-to-intermediate screw was not accurate; restore the
+                # proven low-torso contract before retrying live geometry.
+                ramp_torso(TORSO_GRASP, steps=120)
+                torso_ready = True
+                continue
+            torso_ready = True
             r2 = -1 if r1 == -1 else env.log_motion(
                 "Stage 3 align", planner.static_manipulation, final,
                 n_init_qpos=100, disable_lift_joint=False)
