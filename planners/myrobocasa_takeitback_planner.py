@@ -522,7 +522,11 @@ def planning(env, seed, debug=False, vis=None, info=False):
             if cz <= rest_z + 0.01:
                 break
             b = hold_b()
-            b[2] = max(b[2] - 0.005, 0.0)
+            if b[2] <= 0.001:
+                # No further torso motion is possible; avoid repeating no-op
+                # steps when a held cup cannot reach the surface.
+                break
+            b[2] -= 0.005
             a = np.zeros(14)
             a[:7] = hold_a()
             a[7] = planner.gripper_state
