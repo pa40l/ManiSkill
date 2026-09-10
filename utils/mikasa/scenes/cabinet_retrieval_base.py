@@ -57,9 +57,9 @@ from .robocasa_utils import (
 TASK_STATE_KEYS = ("has_been_lifted", "succeeded", "place_target")
 
 INSTRUCTIONS = (
-    "Take the cup out of the open cabinet and put it on the counter.",
-    "Get the cup down from the cabinet onto the counter.",
-    "Fetch the cup from the cabinet shelf and set it on the counter.",
+    "Take the cup out of the open wall cabinet and set it down on the counter.",
+    "Get the cup down from the cabinet shelf onto the counter.",
+    "Fetch the cup from the open cabinet and put it on the counter below.",
 )
 
 

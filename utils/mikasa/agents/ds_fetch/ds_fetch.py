@@ -50,17 +50,27 @@ class MikasaDSFetch(Fetch):
 
     @property
     def _sensor_configs(self):
-        return [
-            # CameraConfig(
-            #     uid="fetch_head",
-            #     pose=Pose.create_from_pq([0, 0, 0], [1, 0, 0, 0]),
-            #     width=256,
-            #     height=256,
-            #     fov=2,
-            #     near=0.01,
-            #     far=100,
-            #     entity_uid="head_camera_link",
-            # ),
+        """The real Fetch's cameras (2026-09-10, the owner: "откати их к реальному fetch"):
+        one camera ON the head — `fetch_head`, at the head camera frame's origin, looking
+        along it, turning with head_pan / head_tilt — and the wrist camera `fetch_hand` on
+        the gripper. The two "base" cameras this robot carried since the fork
+        (`left/right_base_camera_link`: on the head link but 0.5 m behind and 0.5 m beside
+        it, pitched down, turned inward) looked at the robot from outside — its own torso
+        and raised arm filled their frames; they stay only behind MIKASA_SHOULDER_CAMERAS=1
+        for reading old recordings side by side. 256 x 256 at fov 1.5 rad (86 deg) for the
+        head, as those were, so a policy's image size does not change; the stock ManiSkill
+        Fetch uses 128 at fov 2."""
+        cams = [
+            CameraConfig(
+                uid="fetch_head",
+                pose=Pose.create_from_pq([0, 0, 0], [1, 0, 0, 0]),
+                width=256,
+                height=256,
+                fov=float(os.environ.get("MIKASA_HEAD_CAMERA_FOV", "1.5")),
+                near=0.01,
+                far=100,
+                entity_uid="head_camera_link",
+            ),
             CameraConfig(
                 uid="fetch_hand",
                 pose=Pose.create_from_pq(
@@ -73,31 +83,27 @@ class MikasaDSFetch(Fetch):
                 far=100,
                 entity_uid="gripper_link",
             ),
-            CameraConfig(
-                uid="left_base_camera_link",
-                pose=Pose.create_from_pq(
-                    [-0.5, 0.5, 0], euler.euler2quat(0, 0.3, -0.2)
-                ),
-                width=256,
-                height=256,
-                fov=1.5,
-                near=0.01,
-                far=100,
-                entity_uid="head_camera_link",
-            ),
-            CameraConfig(
-                uid="right_base_camera_link",
-                pose=Pose.create_from_pq(
-                    [-0.5, -0.5, 0], euler.euler2quat(0, 0.3, 0.2)
-                ),
-                width=256,
-                height=256,
-                fov=1.5,
-                near=0.01,
-                far=100,
-                entity_uid="head_camera_link",
-            ),
         ]
+        if os.environ.get("MIKASA_SHOULDER_CAMERAS", "0") == "1":
+            cams += [
+                CameraConfig(
+                    uid="left_base_camera_link",
+                    pose=Pose.create_from_pq(
+                        [-0.5, 0.5, 0], euler.euler2quat(0, 0.3, -0.2)
+                    ),
+                    width=256, height=256, fov=1.5, near=0.01, far=100,
+                    entity_uid="head_camera_link",
+                ),
+                CameraConfig(
+                    uid="right_base_camera_link",
+                    pose=Pose.create_from_pq(
+                        [-0.5, -0.5, 0], euler.euler2quat(0, 0.3, 0.2)
+                    ),
+                    width=256, height=256, fov=1.5, near=0.01, far=100,
+                    entity_uid="head_camera_link",
+                ),
+            ]
+        return cams
 
     @property
     def _controller_configs(self):

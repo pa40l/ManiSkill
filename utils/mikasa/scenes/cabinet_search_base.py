@@ -107,35 +107,34 @@ TASK_STATE_OPTIONAL = ("seen_count", "cube_spawn")
 #: an unstated rule with an instant fail would fail an agent that follows the
 #: instruction literally (review finding).
 INSTRUCTIONS = (
-    "Find the cube hidden in the wall cabinets. Go to the marked spot on the "
-    "floor before opening any cabinet, close each cabinet you open, and "
-    "return to the mark before opening the next. Never open a cabinet you "
-    "have already opened.",
-    "A cube is hidden in the wall cabinets. Starting from the floor mark, "
-    "open cabinets to look for it; close the cabinet behind you and come "
-    "back to the mark before trying another. Do not open a cabinet you "
-    "already opened.",
-    "Search the wall cabinets for the cube. Every search starts at the "
-    "marked spot: shut each cabinet after looking and head back to the mark "
-    "before the next. Opening the same cabinet again fails the task.",
+    "A red cube is hidden in a wall cabinet. Start from the yellow mark on the floor. "
+    "Open a cabinet and look inside; if the cube is not there, close that cabinet, go "
+    "back to the yellow mark and try another. Never open the same cabinet again.",
+    "Find the cube hidden in the wall cabinets. Before opening any cabinet, stand on the "
+    "yellow floor mark; close each cabinet you open and return to the mark before opening "
+    "the next. Do not open a cabinet you have already opened.",
+    "Search the wall cabinets for the hidden red cube, starting from the yellow mark on "
+    "the floor: open a cabinet, look; if the cube is not there close the door, come back "
+    "to the mark and choose a different cabinet. A cabinet you have opened must not be "
+    "opened again.",
 )
 
 #: The same three under the touch terminal (`cfg.terminal == "nudge"`): the goal
 #: is STATED — the episode ends on a push of the cube, and a policy that only
 #: looks would wait out the horizon without being told why. Same word rules.
 INSTRUCTIONS_NUDGE = (
-    "Find the cube hidden in the wall cabinets and nudge it when you find it. "
-    "Go to the marked spot on the floor before opening any cabinet, close "
-    "each cabinet you open, and return to the mark before opening the next. "
-    "Never open a cabinet you have already opened.",
-    "A cube is hidden in the wall cabinets. Starting from the floor mark, "
-    "open cabinets to look for it and give it a push when you see it; close "
-    "the cabinet behind you and come back to the mark before trying another. "
-    "Do not open a cabinet you already opened.",
-    "Search the wall cabinets for the cube and push it when you find it. "
-    "Every search starts at the marked spot: shut each cabinet after looking "
-    "and head back to the mark before the next. Opening the same cabinet "
-    "again fails the task.",
+    "A red cube is hidden in a wall cabinet. Start from the yellow mark on the floor. "
+    "Open a cabinet and look inside; if the cube is there, give it a push. If not, close "
+    "that cabinet, go back to the yellow mark and try another. Never open the same "
+    "cabinet again.",
+    "Find the cube hidden in the wall cabinets and nudge it when you see it. Before "
+    "opening any cabinet, stand on the yellow floor mark; close each cabinet you open and "
+    "return to the mark before opening the next. Do not open a cabinet you have already "
+    "opened.",
+    "Search the wall cabinets for the hidden red cube, starting from the yellow mark on "
+    "the floor: open a cabinet, look, push the cube if it is there; otherwise close the "
+    "door, come back to the mark and choose a different cabinet. A cabinet you have "
+    "opened must not be opened again.",
 )
 
 #: The W13-measured graspable depth band on the cabinet shelf (y, world). The

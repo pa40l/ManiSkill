@@ -85,6 +85,7 @@ import sys
 import gymnasium as gym
 import numpy as np
 import sapien
+import torch
 
 from mani_skill.utils.wrappers import RecordEpisode
 
@@ -686,14 +687,63 @@ seed 2 fell still clears 55. Appended rather than substituted: the four 65 deg
 candidates are what every passing seed uses, and the loop breaks on the first one
 that satisfies the flags."""
 
-PRE_TILT_DEG = float(os.environ.get("MIKASA_PRE_TILT_DEG", "90.0"))
-"""The owner's rule (2026-09-09): the condiment is brought to HORIZONTAL before it enters
-the space over the bowl. At the bowl dock, before the hover, the held object is rolled
-this far about the hand's own approach axis (a wrist roll; the object origin stays where
-it is), the hover then carries the horizontal object over the bowl, and the pour is the
-remaining `POUR_TILT_DEG - PRE_TILT_DEG` about the same axis in the same direction. The
-sign is the one for which the pre-tilt AND the full tilt plan by a straight screw from
-the dock posture. 0 disables the stage (hover upright, as before 2026-09-09)."""
+PRE_TILT_DEG = float(os.environ.get("MIKASA_PRE_TILT_DEG", "0.0"))
+"""**0 — no pre-tilt (2026-09-09, late).** The stage existed for a day on a misreading of
+the owner's "приправа должна быть горизонтальна до того как попала над миску": it meant
+KEEP THE CONDIMENT LEVEL until it is over the bowl, not lay it on its side first — a real
+shaker would spill at that first turn ("Тогда уж сначала подвёл руку — потом повернул
+гриппер"). So the object rides upright to the hover and the pour is ONE wrist turn over
+the bowl (`WRIST_LINE_TILT`); the pour's direction is predicted at the dock by FK so the
+hover can already lead the landing (`POUR_LANDING_LEAD`). A positive value re-enables the
+old stage: at the dock the object is rolled this far about the hand's approach axis, the
+hover carries it so, the pour is the remainder."""
+
+DRIVE_SWING_BEFORE_TUCK = os.environ.get("MIKASA_DRIVE_SWING_BEFORE_TUCK", "1") == "1"
+SWING_PAN_DEG = float(os.environ.get("MIKASA_SWING_PAN_DEG", "90"))
+"""When the drive to the bowl dock refuses with the arm out (the bowl by the left wall:
+57 of 200 layouts on 3800–3999, the held object leads the drive into the wall), swing the
+arm ASIDE by the shoulder pan — one joint, a joint line, the object stays upright and at
+its height — probe the drive from that posture, drive forward, swing back at the dock.
+Before the backwards drive (the cameras face forward; a policy taught to reverse 1.5 m
+sees nothing of where it goes) and before the tuck (the yaw-90 carry winds the rolls)."""
+
+POUR_LANDING_LEAD = float(os.environ.get("MIKASA_POUR_LANDING_LEAD", "0.06"))
+"""Metres the hover (and the pour's aim) is led AGAINST the cap's direction, so what
+comes out lands in the bowl's middle (the owner on 3811, 2026-09-09: the condiment tipped
+the wrong way and would have poured past the bowl). After the pre-tilt the object's +Z —
+the cap — is horizontal along a known direction `u`; the pour continues about the same
+axis, so at 165° the cap sits `top·sin 15°` ≈ 1–2 cm along `u` from the origin, the origin
+itself drifts ~2 cm along `u` on the wrist's circle, and the stream leaves the cap 15° off
+vertical toward `u` — measured on 3811: cap 5.6 cm from the bowl's centre, the landing
+~10 cm out, a 13 cm bowl. With the origin aimed `POUR_LANDING_LEAD` against `u` the cap
+ends on the far side of the centre and the stream leans back into the middle. `over_bowl`
+reads the origin within 10 cm, so the lead costs nothing on the predicate."""
+
+LOOK_AROUND = os.environ.get("MIKASA_LOOK_AROUND", "1") == "1"
+LOOK_PAN_RAD = float(os.environ.get("MIKASA_LOOK_PAN_RAD", "1.40"))
+LOOK_DWELL_STEPS = int(os.environ.get("MIKASA_LOOK_DWELL", "6"))
+"""The look-around (the owner, 2026-09-09): after the condiment is lifted and before the
+base turns, the head pans to one side, dwells, pans to the other, dwells, and returns —
+a joint line on `head_pan_joint` each, in the recorded actions (the body channel). The
+robot's two base cameras hang on `head_camera_link`, so this is what puts the bowl into
+the robot's own view: read off the cameras at step 0, the bowl 1.5–2 m along the counter
+is in none of them, and a policy has no way to know which way to drive. Recorded as the
+oracle's own motion, it is the behaviour the policy is meant to learn — look, remember
+the side, then drive."""
+
+WRIST_LINE_TILT = os.environ.get("MIKASA_WRIST_LINE_TILT", "1") == "1"
+"""The pre-tilt and the pour as a joint LINE on `wrist_roll_joint` alone (2026-09-09): the
+motion the owner described — extend the arm, then turn the wrist. A screw to the same
+pose spreads the roll over the arm (3852: the wrist did 63 % of it, the rest went to
+upperarm roll, shoulder lift, wrist flex — the pseudo-inverse's least-norm step, a
+property of `plan_screw`, not of the target). The wrist value is found by FK: the object's
+attitude is the TCP's times the in-hand transform, so the tilt for every wrist angle is
+known before anything moves. The object origin rides a circle of radius |T_tcp_obj.p| —
+2 cm — well inside `over_bowl`. The screw candidates stay as the fallback."""
+
+DRIVE_LINE_TUCK_BEFORE_RRT_TUCK = os.environ.get("MIKASA_DRIVE_LINE_TUCK", "1") == "1"
+"""After the backwards try and before the RRT tuck: the tuck as a straight joint line
+(`carry_pose(by_line=True, max_knots=1, knot_refuse=True)`), then nose-first."""
 
 DRIVE_REVERSE_BEFORE_TUCK = os.environ.get("MIKASA_DRIVE_REVERSE_BEFORE_TUCK", "1") == "1"
 """When the drive to the bowl dock refuses with the arm out, try the same drive backwards
@@ -1334,6 +1384,59 @@ def tilted_in_place(obj_pose: sapien.Pose, T_tcp_obj: sapien.Pose, axis_world, t
     q_t = quat_about(axis_world, math.radians(float(tilt_deg)))
     q_obj = (sapien.Pose(q=q_t) * sapien.Pose(q=np.asarray(obj_pose.q, dtype=np.float64))).q
     return sapien.Pose(p=np.asarray(obj_pose.p, dtype=np.float64), q=q_obj) * T_tcp_obj.inv()
+
+
+def tcp_at(task, qpos) -> sapien.Pose:
+    """The TCP pose the robot would have at `qpos` — the simulator's own FK, by setting
+    the articulation's qpos and reading the link, then restoring. No step is taken."""
+    robot = task.agent.robot
+    q0 = robot.get_qpos()
+    robot.set_qpos(torch.as_tensor(np.asarray(qpos, dtype=np.float32)).reshape(1, -1))
+    try:
+        return task.agent.tcp.pose[0].sp
+    finally:
+        robot.set_qpos(q0)
+
+
+def object_tilt_deg(obj_q) -> float:
+    """Degrees between the object's +Z and the world's +Z (the task's `tilt_rad`)."""
+    R = sapien.Pose(q=np.asarray(obj_q, dtype=np.float64)).to_transformation_matrix()[:3, :3]
+    return float(math.degrees(math.acos(max(-1.0, min(1.0, float(R[2, 2]))))))
+
+
+def wrist_roll_for_tilt(task, T_tcp_obj: sapien.Pose, tilt_deg: float, *, step_deg: float = 2.0,
+                        prefer_sign: int = 0, max_turn_deg: float = 200.0):
+    """The `wrist_roll_joint` value at which the held object's tilt first reaches
+    `tilt_deg`, turning the wrist alone from where it is — `(q_wrist, predicted_tilt,
+    sign)`, or None when no turn within `max_turn_deg` either way gets there (or the
+    joint's limits are in the way). FK per candidate through `tcp_at`; the object's
+    attitude is TCP · T_tcp_obj. `prefer_sign` (+1/−1) tries that direction first and
+    keeps it unless the other needs fewer degrees by a wide margin (the pre-tilt's
+    direction, continued)."""
+    jm = getattr(task.agent.robot, "active_joints_map", None)
+    if jm is None or "wrist_roll_joint" not in jm:
+        return None
+    j = jm["wrist_roll_joint"]
+    idx = int(j.active_index[0])
+    lo, hi = (float(v) for v in _np(j.limits).reshape(-1)[:2])
+    q0 = _np(task.agent.robot.get_qpos()).reshape(-1).astype(np.float64)
+    best = None
+    signs = (prefer_sign, -prefer_sign) if prefer_sign else (1, -1)
+    for sign in signs:
+        for k in range(1, int(max_turn_deg / step_deg) + 1):
+            qw = q0[idx] + sign * math.radians(k * step_deg)
+            if qw < lo + 0.02 or qw > hi - 0.02:
+                break
+            q = q0.copy(); q[idx] = qw
+            tilt = object_tilt_deg((tcp_at(task, q) * T_tcp_obj).q)
+            if tilt >= tilt_deg:
+                cand = (float(qw), tilt, sign, k)
+                if best is None or cand[3] < best[3] - 10:      # the other way only if much shorter
+                    best = cand
+                break
+        if best is not None and prefer_sign and best[2] == prefer_sign:
+            break
+    return None if best is None else best[:3]
 
 
 def _flag(info, key) -> bool:
@@ -2022,18 +2125,36 @@ def _solve(
     # (`shoulder_lift`) at every height offered — the arm alone cannot span the rise from
     # those configurations, so the choice is a torso-driven lift or an RRT that rakes the
     # counter. A probe executes nothing, so the whole search is free in episode steps.
-    for freeze in (True, False):
-        for z_try in lift_rungs:
-            cand = sapien.Pose(np.array([grasp.p[0], grasp.p[1], z_try]), grasp.q)
-            if common.screw_plans(planner, cand, disable_lift_joint=freeze):
-                lift_target, lift_freeze, found = cand, freeze, True
-                if z_try != lift_z or not freeze:
-                    say(env, "lift takes a screw-reachable rung",
-                        asked=round(float(lift_z), 3), taking=round(float(z_try), 3),
-                        torso_frozen=freeze)
+    # The lift's screw is probed and executed (2026-09-09, 3811 — the bottle dropped on an
+    # RRT lift that twisted the forearm 0.7 rad while the torso rose) with:
+    # - the arrival gate opened to the room above the lift floor (`screw_tolerance`): a
+    #   knot before a joint stop that is 2.5 cm short of a target 3 cm above the floor IS
+    #   a lift — the height only has to clear the neighbour;
+    # - the held object's contact with the counter allowed in the model (`allow_held_contacts`),
+    #   so neither the screw's own collision check nor the RRT fallback starts from a
+    #   state mplib calls invalid.
+    # NOT under `roll_room` (measured 2026-09-09, 3811): a lift that takes a roll joint past
+    # the planning window leaves every later plan clipping the start qpos to the window —
+    # the model's FK then disagrees with the simulator by 0.2 m / 4 deg and the drive's
+    # screw chases a goal the base cannot reach ("no convergence after 200 step(s)"). The
+    # room is only safe where everything after it is under the room too (hover → pour).
+    lift_tol = {z: (max(0.02, float(z) - float(lift_floor)), 0.10) for z in lift_rungs}
+    held_stem = "shaker" if target is task.shaker else "condiment_bottle"
+    with common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift") as _touch:
+        for freeze in (True, False):
+            for z_try in lift_rungs:
+                cand = sapien.Pose(np.array([grasp.p[0], grasp.p[1], z_try]), grasp.q)
+                with common.screw_tolerance(planner, lift_tol[z_try]):
+                    ok = common.screw_plans(planner, cand, disable_lift_joint=freeze)
+                if ok:
+                    lift_target, lift_freeze, found = cand, freeze, True
+                    if z_try != lift_z or not freeze:
+                        say(env, "lift takes a screw-reachable rung",
+                            asked=round(float(lift_z), 3), taking=round(float(z_try), 3),
+                            torso_frozen=freeze)
+                    break
+            if found:
                 break
-        if found:
-            break
     if not found:
         # K79q: the exhausted probe was silent — its only trace was the *absence* of the
         # line above, and it is the precise predictor of the RRT dive that follows (the
@@ -2077,7 +2198,8 @@ def _solve(
             dz = float(z_try) - float(grasp.p[2])
             if dz < 0.05 or t_now + dz > t_max + 1e-6:
                 continue
-            with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+            with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), \
+                    common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift by the torso"):
                 r = common.plan_joints(env, planner, task, {"torso_lift_joint": t_now + dz},
                                        label="lift by the torso", tries=1, who=WHO,
                                        line_only=True)
@@ -2086,10 +2208,52 @@ def _solve(
                     torso=round(t_now + dz, 3))
                 res = r
                 break
+        if res == -1 and lift_rungs_torso:
+            # The torso as far as it goes, then the screw rungs again for the rest
+            # (2026-09-09, 3811: the bottle's 0.206 m lift met the forearm's window
+            # 4.4 cm short by the arm alone; the torso had 0.10 m to its stop).
+            dz_room = t_max - t_now
+            if dz_room >= 0.05:
+                with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), \
+                        common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift by the torso"):
+                    r = common.plan_joints(env, planner, task, {"torso_lift_joint": t_max},
+                                           label="lift by the torso to its stop", tries=1, who=WHO,
+                                           line_only=True)
+                if r != -1:
+                    if common.stopped_by_horizon(planner):
+                        return r
+                    say(env, "torso at its stop; the screw for the rest", rise=round(dz_room, 3),
+                        object_z=round(float(_np(target.pose.p).reshape(-1, 3)[0][2]), 3))
+                    planner.planner.update_from_simulation()
+                    grasp_now = task.agent.tcp.pose[0].sp
+                    with common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift"):
+                        for freeze in (True, False):
+                            for z_try in lift_rungs:
+                                cand = sapien.Pose(np.array([grasp_now.p[0], grasp_now.p[1], z_try]), grasp_now.q)
+                                with common.screw_tolerance(planner, lift_tol[z_try]):
+                                    ok = common.screw_plans(planner, cand, disable_lift_joint=freeze)
+                                if ok:
+                                    lift_target, lift_freeze, found = cand, freeze, True
+                                    say(env, "lift takes a screw-reachable rung after the torso",
+                                        taking=round(float(z_try), 3), torso_frozen=freeze)
+                                    break
+                            if found:
+                                break
+                    if found:
+                        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), \
+                                common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift"), \
+                                common.screw_tolerance(planner, lift_tol[min(lift_rungs, key=lambda z: abs(z - float(lift_target.p[2])))]):
+                            res = planner.static_manipulation(lift_target, disable_lift_joint=lift_freeze,
+                                                              **_knot_kw_straight(planner))
+                    if res == -1:
+                        say(env, "the screw after the torso refused; the RRT")
         if res == -1:
             say(env, "no torso line fits the lift; the RRT")
     if res == -1:
-        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+        z_take = min(lift_rungs, key=lambda z: abs(z - float(lift_target.p[2])))
+        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), \
+                common.allow_held_contacts(env, planner, (held_stem,), WHO, "lift"), \
+                common.screw_tolerance(planner, lift_tol.get(z_take, (0.02, 0.10))):
             if not found and LIFT_MAX_KNOTS is not None:
                 # No screw rung and no torso room (377 @0.15: torso 0.368 of 0.386 at
                 # the grasp): the RRT lift, drawn up to LIFT_KNOT_DRAWS times and the
@@ -2139,11 +2303,36 @@ def _solve(
     # never once refused — it was buying nothing and costing a quarter of the motion.
     # jezv's planners have no equivalent stage at all.
 
+    # -- STAGE 3b: the look-around (LOOK_AROUND) ----------------------------------------------
+    if LOOK_AROUND and callable(getattr(planner, "turn_head", None)):
+        # The head's own channels (`turn_head`): the head is not in the arm's planning
+        # chain, so this is not a planned leg — the arm and the base are held.
+        say(env, "look around for the bowl", pan_rad=LOOK_PAN_RAD, dwell=LOOK_DWELL_STEPS)
+        for pan in (LOOK_PAN_RAD, -LOOK_PAN_RAD, 0.0):
+            r = planner.turn_head(pan=float(pan))
+            if r != -1:
+                res = r
+                if common.stopped_by_horizon(planner):
+                    return res
+            if pan != 0.0:
+                settled = planner.idle_steps(t=LOOK_DWELL_STEPS)
+                if settled != -1:
+                    res = settled
+                    if common.stopped_by_horizon(planner):
+                        return res
+        planner.planner.update_from_simulation()
+
     # -- STAGE 4: drive to the bowl dock -----------------------------------------------------
     dock = _np(task._bowl_dock_np)[0].astype(np.float64)
     face = np.array([math.cos(dock[2]), math.sin(dock[2]), 0.0])
     dock_xyz = np.array([dock[0], dock[1], 0.0])
     say(env, "drive to bowl dock", dock=[round(float(v), 3) for v in dock_xyz])
+    # The head watches the bowl for the whole drive (`head_look_at`, 2026-09-09): forward
+    # it is ahead, backwards the head at ±1.5 looks along the counter and the bowl comes
+    # into the base cameras as the dock nears. The arm followers park the head at zero
+    # again, so the hover starts as before.
+    _look = common.head_look_at(planner, _np(task.bowl.pose.p)[0].astype(np.float64))
+    _look.__enter__()
     # `freeze_arm=True` plans the translation with the base's three joints and nothing
     # else (`BASE_ONLY_PLAN_MASK`). Without it `move_base_forward` asks fifteen joints to
     # produce a pure base translation and runs one of them into a limit: measured here on
@@ -2152,9 +2341,75 @@ def _solve(
     # was to move the base. The mask's own docstring records the same disease on
     # water-plants seed 11. It was never needed while the drive was a fixed 0.39 m; the
     # drawn layout makes it up to 2.2 m.
-    res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True)
+    # Nose-first only (`reverse_ok=False`): the recoveries below decide what comes next
+    # when it refuses — the swing first, backwards only after it, the tuck last.
+    _nose_first = ({"reverse_ok": False} if "reverse_ok" in _inspect.signature(planner.drive_base).parameters else {})
+    res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True, **_nose_first)
     if res != -1 and common.stopped_by_horizon(planner):
         return res
+    swung_from = None            # the shoulder pan to return to after a swung drive
+    if res == -1 and DRIVE_SWING_BEFORE_TUCK:
+        # The arm swung ASIDE by the shoulder pan (see DRIVE_SWING_BEFORE_TUCK): the
+        # forward drive is probed from the swung posture before anything moves.
+        jm = getattr(task.agent.robot, "active_joints_map", None)
+        probe = getattr(planner, "drive_plans_after_turn", None)
+        if jm is not None and "shoulder_pan_joint" in jm and callable(probe):
+            pan = jm["shoulder_pan_joint"]
+            p_idx = int(pan.active_index[0])
+            p_lo, p_hi = (float(v) for v in _np(pan.limits).reshape(-1)[:2])
+            q0 = _np(task.agent.robot.get_qpos()).reshape(-1).astype(np.float64)
+            base_p = _np(task.agent.base_link.pose.p).reshape(-1)[:3]
+            ahead = np.array([dock_xyz[0] - base_p[0], dock_xyz[1] - base_p[1], 0.0])
+            for sign in (1, -1):
+                p_try = q0[p_idx] + sign * math.radians(SWING_PAN_DEG)
+                if p_try < p_lo + 0.05 or p_try > p_hi - 0.05:
+                    continue
+                q_hyp = q0.copy(); q_hyp[p_idx] = p_try
+                if not probe(dock_xyz, ahead, qpos=q_hyp, tcp=tcp_at(task, q_hyp), view=face):
+                    say(env, "swing probed: the drive or the closing turn would not plan", pan_deg=sign * SWING_PAN_DEG)
+                    continue
+                say(env, "swing the arm aside for the drive", pan_deg=sign * SWING_PAN_DEG)
+                with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+                    r = common.plan_joints(env, planner, task, {"shoulder_pan_joint": p_try},
+                                           label="swing for the drive", tries=1, who=WHO, line_only=True)
+                if r == -1:
+                    continue
+                if common.stopped_by_horizon(planner):
+                    return r
+                if not bool(_np(task.agent.is_grasping(target)).any()):
+                    say(env, "missed: dropped during the swing")
+                    return r
+                planner.planner.update_from_simulation()
+                res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True,
+                                         **_nose_first)
+                if res != -1:
+                    swung_from = float(q0[p_idx])
+                    break
+                say(env, "drive refused after the swing")
+        if res != -1 and common.stopped_by_horizon(planner):
+            return res
+    def drive_after_tuck(**kw):
+        """The drive from a tucked posture, once more with the held object's contact
+        against the arm allowed in the model when that is what refused it (2025 @0.15,
+        2026-09-06: the tuck executed to 2 mm and the drive's screw was refused
+        `shoulder_lift_link <-> condiment_bottle after 1 step` — the held bottle rests
+        against the shoulder in the MODEL, and mplib will not plan out of a start it
+        considers in collision; the object is held, that contact is harmless)."""
+        planner.planner.update_from_simulation()
+        with common.capture_refusal("collision ") as cap:
+            r = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True, **kw)
+        if r == -1 and DRIVE_ALLOW_HELD_TOUCH and cap.refusal is not None:
+            stem = "shaker" if target is task.shaker else "condiment_bottle"
+            link = held_touch_link(cap.refusal, stem)
+            if link is not None:
+                say(env, "the tucked object touches the arm in the model; allowing that contact",
+                    link=link, refusal=cap.refusal[:80])
+                common.hold_object_in_planner(env, planner, task, target, held=True, who=WHO,
+                                              extra_touch=(link,))
+                planner.planner.update_from_simulation()
+                r = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True, **kw)
+        return r
+
     if res == -1:
         # The drive refused with the arm out. Pull the object in over the base and ask
         # again (K74). This is `carry_pose` earning its place back: K57 deleted it as a
@@ -2177,6 +2432,27 @@ def _solve(
                                      reverse_only=True)
             if res != -1 and common.stopped_by_horizon(planner):
                 return res
+    if res == -1 and DRIVE_LINE_TUCK_BEFORE_RRT_TUCK:
+        # The tuck as a joint LINE (`carry_pose` asked for a straight plan only — the
+        # joint line to the nearest IK solution, no RRT, the yaw ladder as before), then
+        # the drive nose-first. AFTER the backwards try since 2026-09-09 late: measured,
+        # the line itself tilts the held condiment 27–65 deg on the way in (3811 28, 3608
+        # 27, 3852 65) — a real shaker spills there — while the backwards drive keeps it
+        # within 3 deg; and the hover out of the tuck is the rung ladder or RRT. Kept
+        # ahead of the RRT tuck, which winds the rolls on top of that.
+        say(env, "drive refused with the arm out; pulling the arm in by a joint line")
+        tucked = common.carry_pose(env, planner, task, target, who=WHO,
+                                   max_knots=1, knot_draws=1, knot_refuse=True, by_line=True)
+        if tucked != -1 and common.stopped_by_horizon(planner):
+            return tucked
+        if tucked != -1:
+            res = drive_after_tuck(**_nose_first)
+            if res != -1 and common.stopped_by_horizon(planner):
+                return res
+            if res == -1:
+                say(env, "drive refused after the line tuck")
+        else:
+            say(env, "no straight tuck")
     if res == -1:
         say(env, "drive refused with the arm out; tucking and retrying")
         tucked = common.carry_pose(env, planner, task, target, who=WHO,
@@ -2185,31 +2461,28 @@ def _solve(
             return tucked
         if tucked == -1:
             return fail(env, "drive to bowl dock")
-        planner.planner.update_from_simulation()
-        with common.capture_refusal("collision ") as cap:
-            res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True)
-        if res == -1 and DRIVE_ALLOW_HELD_TOUCH and cap.refusal is not None:
-            # 2025 @0.15 (2026-09-06): the tuck (yaw 90) executed to 2 mm and the drive's
-            # screw was then refused `shoulder_lift_link <-> condiment_bottle after 1
-            # step` — the held bottle rests against the shoulder in the MODEL, and mplib
-            # will not plan out of a start it considers in collision. The object is held;
-            # that contact is harmless. Allow it for the attachment and drive once more.
-            stem = "shaker" if target is task.shaker else "condiment_bottle"
-            link = held_touch_link(cap.refusal, stem)
-            if link is not None:
-                say(env, "the tucked object touches the arm in the model; allowing that contact",
-                    link=link, refusal=cap.refusal[:80])
-                common.hold_object_in_planner(env, planner, task, target, held=True, who=WHO,
-                                              extra_touch=(link,))
-                planner.planner.update_from_simulation()
-                res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True)
+        res = drive_after_tuck()
         if res != -1 and common.stopped_by_horizon(planner):
             return res
         if res == -1:
             return fail(env, "drive to bowl dock (after the tuck)")
+    _look.__exit__(None, None, None)
     planner.planner.update_from_simulation()
     d_dock, dyaw = common.dock_error(task, (dock[0], dock[1], dock[2]))
     say(env, "parked at the dock", d_dock=round(d_dock, 3), dyaw_deg=round(dyaw, 1))
+    if swung_from is not None:
+        # The arm back in front, the same one joint; a refused line leaves it aside and
+        # the hover plans from wherever the arm stands.
+        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+            r = common.plan_joints(env, planner, task, {"shoulder_pan_joint": swung_from},
+                                   label="swing back", tries=1, who=WHO, line_only=True)
+        if r != -1:
+            res = r
+            if common.stopped_by_horizon(planner):
+                return res
+        else:
+            say(env, "swing back refused; hovering from the side")
+        planner.planner.update_from_simulation()
     if not _flag(res[-1], "distractor_ok"):
         say(env, "missed: distractor moved during the drive", distractor_ok=False,
             distractor_moved=round(float(_np(res[-1]["distractor_moved"]).reshape(-1)[0]), 3))
@@ -2248,6 +2521,8 @@ def _solve(
     obj_q_up = obj_q                       # the upright reference the pour tilts from
     obj_q_hover = obj_q                    # what the hover carries: upright, or pre-tilted
     tilt_axis, tilt_sign = None, 0
+    wrist_sign = 0                         # the wrist line's direction, when the pre-tilt was one
+    cap_dir = np.zeros(3)                  # the cap's horizontal direction after the pre-tilt (POUR_LANDING_LEAD)
 
     def pre_tilt_rank():
         """The pre-tilt directions from where the arm stands now, best first, or None:
@@ -2280,12 +2555,37 @@ def _solve(
     def pre_tilt():
         """Executes the pre-tilt; the follower's tuple, or None when it did not run.
         Sets `obj_q_hover`, `T_tcp_obj`, `tilt_axis`, `tilt_sign` on success."""
-        nonlocal obj_q_hover, T_tcp_obj, tilt_axis, tilt_sign
-        probed = pre_tilt_rank()
-        if probed is None:
-            return None
-        ranked, axis = probed
+        nonlocal obj_q_hover, T_tcp_obj, tilt_axis, tilt_sign, wrist_sign
         res_pre = -1
+        if WRIST_LINE_TILT and PRE_TILT_DEG > 0.0:
+            # One joint: the wrist rolled until the object is horizontal (WRIST_LINE_TILT).
+            # The direction with the shorter turn; the pour continues it.
+            T_now = (task.agent.tcp.pose[0].inv() * target.pose[0]).sp
+            # The direction with room for the WHOLE pour: the wrist value at the strong
+            # rung, each way; the one nearer zero (3811: +90 took the wrist to 6.10 of
+            # 6.28 and no turn was left for the pour).
+            room = {}
+            for sg in (1, -1):
+                r = wrist_roll_for_tilt(task, T_now, POUR_TILT_STRONG_DEG, prefer_sign=sg)
+                if r is not None and r[2] == sg:
+                    room[sg] = abs(r[0])
+            prefer = min(room, key=room.get) if room else 0
+            found = wrist_roll_for_tilt(task, T_now, PRE_TILT_DEG, prefer_sign=prefer)
+            if found is not None:
+                q_w, tilt_pred, sign = found
+                say(env, "pre-tilt by the wrist", to=round(q_w, 3), predicted_tilt_deg=round(tilt_pred, 1), sign=sign)
+                with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+                    res_pre = common.plan_joints(env, planner, task, {"wrist_roll_joint": q_w},
+                                                 label="pre-tilt by the wrist", tries=1, who=WHO, line_only=True)
+                if res_pre != -1:
+                    wrist_sign = int(sign)
+                    tilt_axis, tilt_sign = approach_axis_xy(task), 0
+        ranked, axis = [], None
+        if res_pre == -1:
+            probed = pre_tilt_rank()
+            if probed is None:
+                return None
+            ranked, axis = probed
         for _score, _neg_roll, sign, pre_tcp, ok_pre, _ok_full, _roll in ranked:
             if not ok_pre:
                 continue
@@ -2310,15 +2610,53 @@ def _solve(
         # aimed with the in-hand offset of the same still moment.
         T_tcp_obj = (task.agent.tcp.pose[0].inv() * target.pose[0]).sp
         obj_q_hover = np.asarray(target.pose[0].sp.q, dtype=np.float64)
+        # The cap's direction: the object's +Z, now horizontal — the pour tips it further
+        # this way, and the hover aims the origin POUR_LANDING_LEAD against it.
+        zax = sapien.Pose(q=obj_q_hover).to_transformation_matrix()[:3, 2]
+        h = float(np.hypot(zax[0], zax[1]))
+        if h > 0.5:
+            cap_dir[:] = [zax[0] / h, zax[1] / h, 0.0]
         say(env, "pre-tilted", tilt_rad=round(float(_np(res_pre[-1]["tilt_rad"]).reshape(-1)[0]), 3),
-            deg=tilt_sign * PRE_TILT_DEG)
+            by="wrist line" if wrist_sign else f"screw {tilt_sign * PRE_TILT_DEG:+.0f}")
         return res_pre
+
+    if PRE_TILT_DEG <= 0.0 and WRIST_LINE_TILT:
+        # The pour's direction, predicted from the dock posture: the hover is a translation
+        # (the wrist keeps its angle), so the wrist turn that brings the object to the tilt
+        # is the same here as over the bowl; FK at that wrist value gives the cap's
+        # direction, and the hover leads the landing against it (`POUR_LANDING_LEAD`).
+        T_now = (task.agent.tcp.pose[0].inv() * target.pose[0]).sp
+        room = {}
+        for sg in (1, -1):
+            r = wrist_roll_for_tilt(task, T_now, POUR_TILT_STRONG_DEG, prefer_sign=sg)
+            if r is not None and r[2] == sg:
+                room[sg] = (abs(r[0]), r[0])
+        if room:
+            wrist_sign = min(room, key=lambda k: room[k][0])
+            jm = task.agent.robot.active_joints_map
+            q_pred = _np(task.agent.robot.get_qpos()).reshape(-1).astype(np.float64).copy()
+            q_pred[int(jm["wrist_roll_joint"].active_index[0])] = room[wrist_sign][1]
+            zax = (tcp_at(task, q_pred) * T_now).to_transformation_matrix()[:3, 2]
+            h = float(np.hypot(zax[0], zax[1]))
+            if h > 0.05:                       # sin 15 deg = 0.26 at the strong rung
+                cap_dir[:] = [zax[0] / h, zax[1] / h, 0.0]
+            say(env, "pour direction predicted", sign=wrist_sign, wrist_to=round(room[wrist_sign][1], 3),
+                cap_dir=[round(float(v), 2) for v in cap_dir])
+        else:
+            say(env, "no wrist turn reaches the tilt from the dock; the hover leads nothing")
 
     hovered = False
     pre_tilted = False
     obj_q_held = obj_q_hover
+    def cap_after(spin_deg: float) -> np.ndarray:
+        """The cap's horizontal direction once the hover's spin has turned the hand."""
+        if spin_deg == 0.0 or not np.any(cap_dir):
+            return cap_dir
+        return np.asarray((sapien.Pose(q=quat_about(np.array([0.0, 0.0, 1.0]), math.radians(float(spin_deg))))
+                           * sapien.Pose(p=cap_dir)).p, dtype=np.float64)
+
     for extra, back, spin in HOVER_RUNGS:
-        aim = bowl_p - back * face
+        aim = bowl_p - back * face - POUR_LANDING_LEAD * cap_after(spin)
         obj_q_try = obj_q_hover if spin == 0.0 else np.asarray(
             (sapien.Pose(q=quat_about(np.array([0.0, 0.0, 1.0]), math.radians(float(spin))))
              * sapien.Pose(q=obj_q_hover)).q
@@ -2346,7 +2684,9 @@ def _solve(
                 q_tilted = np.asarray((sapien.Pose(q=quat_about(axis0, math.radians(sign0 * PRE_TILT_DEG)))
                                        * sapien.Pose(q=obj_q_hover)).q, dtype=np.float64)
                 hover_probe = common.pose_over(aim, HOVER_ABOVE + extra, q_tilted) * T_tcp_obj.inv()
-            if common.screw_plans(planner, hover_probe, disable_lift_joint=False):
+            with common.roll_room(planner):
+                hover_straight = common.screw_plans(planner, hover_probe, disable_lift_joint=False)
+            if hover_straight:
                 say(env, "hover plans straight; skipping the pre-hover waypoint",
                     probed_as="pre-tilted" if hover_probe is not hover else "upright")
             else:
@@ -2368,7 +2708,7 @@ def _solve(
                     # 0.177 m from home, which alone loses the episode (`over_bowl` is read
                     # against the *live* bowl). It must NOT be guarded for the hover and pour
                     # below, which aim at it deliberately.
-                    with common.keepout(planner, [distractor, task.bowl], pad=GRASP_KEEPOUT_PAD):
+                    with common.keepout(planner, [distractor, task.bowl], pad=GRASP_KEEPOUT_PAD), common.roll_room(planner):
                         res = common.arm_move(env, planner, pre, who=WHO, stage="pre-hover",
                                               disable_lift_joint=False,
                                               max_knots=HOVER_MAX_KNOTS, knot_draws=HOVER_KNOT_DRAWS,
@@ -2397,10 +2737,15 @@ def _solve(
                         say(env, "missed: distractor moved during the pre-tilt")
                         return res
                     obj_q_try = obj_q_hover
+                    aim = bowl_p - back * face - POUR_LANDING_LEAD * cap_after(spin)
                     hover = common.pose_over(aim, HOVER_ABOVE + extra, obj_q_try) * T_tcp_obj.inv()
         say(env, "hover over bowl", hover=[round(float(v), 3) for v in hover.p],
             extra=round(float(extra), 3), back=round(float(back), 3), spin_deg=float(spin))
-        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+        # Under roll_room (2026-09-09, 3852): the forearm roll parked at 3.35 by the grasp
+        # and the lift, the straight 15 cm carry over the bowl asked 3.61 and the window
+        # at 3.44 refused it — RRT 125 knots, forearm −4.25 rad, the torso 27 cm down and
+        # up, the shaker 60 cm over the bowl on the way. With the room: a screw of 22–26.
+        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), common.roll_room(planner):
             res = common.arm_move(env, planner, hover, who=WHO, stage="hover over bowl",
                                   disable_lift_joint=False,
                                   max_knots=HOVER_MAX_KNOTS, knot_draws=HOVER_KNOT_DRAWS)
@@ -2468,13 +2813,13 @@ def _solve(
         # live bowl; so does this re-aim, and so do the pour candidates after it.
         bowl_live = _np(task.bowl.pose.p)[0].astype(np.float64)
         bowl_moved = float(np.linalg.norm(bowl_live[:2] - bowl_p[:2]))
-        aim0 = bowl_live - back0 * face
+        aim0 = bowl_live - back0 * face - POUR_LANDING_LEAD * cap_after(float(spin))
         hover2 = common.pose_over(aim0, HOVER_ABOVE + extra0, obj_q_held) * T_live.inv()
         say(env, "hover corrected for the object as held and the bowl as it stands",
             xy_before=round(float(_np(hinfo["xy_to_bowl"]).reshape(-1)[0]), 3),
             bowl_moved=round(bowl_moved, 3),
             shift=[round(float(v), 3) for v in (np.asarray(hover2.p) - np.asarray(hover.p))])
-        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+        with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), common.roll_room(planner):
             r2 = common.arm_move(env, planner, hover2, who=WHO, stage="hover (corrected)",
                                  disable_lift_joint=False,
                                  max_knots=HOVER_MAX_KNOTS, knot_draws=HOVER_KNOT_DRAWS)
@@ -2518,10 +2863,16 @@ def _solve(
     cands = list(pour_candidates(face, along, approach_xy=pour_axis, first_sign=tilt_sign))
     # Indices, not membership: a candidate is `(numpy axis, tilt)` and `in` would compare
     # the arrays element-wise and raise on the ambiguous truth value.
+    # The cap as it points NOW (a spin rung turned it): the screw candidates aim the origin
+    # against it, as the hover did for the wrist line.
+    _z = task.agent.tcp.pose[0].sp.to_transformation_matrix()[:3, :3] @ np.asarray(T_tcp_obj.to_transformation_matrix()[:3, 2])
+    _h = float(np.hypot(_z[0], _z[1]))
+    cap_now = np.array([_z[0] / _h, _z[1] / _h, 0.0]) if _h > 0.5 else np.zeros(3)
+    pour_aim = bowl_p - POUR_LANDING_LEAD * cap_now
     with common.roll_room(planner):
         straight = [i for i, (axis, tilt) in enumerate(cands)
                     if common.screw_plans(
-                        planner, pour_pose_for(bowl_p, POUR_ABOVE, obj_q_up, T_tcp_obj, axis, tilt),
+                        planner, pour_pose_for(pour_aim, POUR_ABOVE, obj_q_up, T_tcp_obj, axis, tilt),
                         disable_lift_joint=POUR_LIFT_FREEZE)]
     if straight:
         rest = [i for i in range(len(cands)) if i not in straight]
@@ -2539,11 +2890,51 @@ def _solve(
         straight_kw = dict(max_knots=1, knot_draws=1, knot_refuse=True)
     passes = [straight_kw, {}] if straight_kw else [{}]
     reached = False
+    if WRIST_LINE_TILT:
+        # The pour as the wrist alone (WRIST_LINE_TILT): the joint value at which the
+        # object's tilt reaches the rung, by FK, continuing the pre-tilt's direction;
+        # the strong rung right behind. The screw candidates below are the fallback.
+        T_now = (task.agent.tcp.pose[0].inv() * target.pose[0]).sp
+        for deg in (POUR_TILT_DEG, POUR_TILT_STRONG_DEG):
+            found = wrist_roll_for_tilt(task, T_now, deg, prefer_sign=wrist_sign)
+            if found is None:
+                say(env, "no wrist turn reaches the tilt", tilt_deg=deg)
+                continue
+            q_w, tilt_pred, sign = found
+            say(env, "pour by the wrist", tilt_deg=deg, to=round(q_w, 3),
+                predicted_tilt_deg=round(tilt_pred, 1), sign=sign)
+            with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD):
+                res = common.plan_joints(env, planner, task, {"wrist_roll_joint": q_w},
+                                         label="pour by the wrist", tries=1, who=WHO, line_only=True)
+            if res == -1:
+                continue
+            if common.stopped_by_horizon(planner):
+                return res
+            planned_any = True
+            settled = planner.idle_steps(t=POUR_SETTLE_STEPS)
+            if settled != -1:
+                res = settled
+            if common.stopped_by_horizon(planner):
+                return res
+            last = res
+            flags = _pour_flags(res[-1])
+            say(env, "pour candidate executed", tilt_rad=round(float(_np(res[-1]["tilt_rad"]).reshape(-1)[0]), 3), **flags)
+            if not flags["grasp_target"]:
+                say(env, "missed: dropped during the tilt")
+                return res
+            if not flags["distractor_ok"]:
+                say(env, "missed: distractor moved during the tilt")
+                return res
+            if flags["tilted"] and flags["over_bowl"] and flags["height_ok"]:
+                reached = True
+                break
+        if reached:
+            passes = []
     for n_pass, pass_kw in enumerate(passes):
         if n_pass == 1:
             say(env, "no straight pour planned; allowing RRT")
         for axis, tilt in cands:
-            pour = pour_pose_for(bowl_p, POUR_ABOVE, obj_q_up, T_tcp_obj, axis, tilt)
+            pour = pour_pose_for(pour_aim, POUR_ABOVE, obj_q_up, T_tcp_obj, axis, tilt)
             say(env, "pour", axis=[round(float(v), 2) for v in axis], tilt_deg=tilt,
                 tcp=[round(float(v), 3) for v in pour.p], straight=bool(pass_kw))
             with common.keepout(planner, [distractor], pad=GRASP_KEEPOUT_PAD), common.roll_room(planner):

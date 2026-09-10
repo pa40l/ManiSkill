@@ -63,10 +63,24 @@ from utils.mikasa.scenes.robocasa_utils import (
 
 #: The task text a language-conditioned policy is given (the VLA dataset's `task`).
 #: It names the chore, never the answer: which condiment the dish needs is shown by
-#: the recipe marker during the cue and is the memory content. No numerals.
+#: the cue marker — a yellow ball over the target for `cue_steps` — and is the memory
+#: content. No numerals. Rewritten 2026-09-10 with the owner: the text describes what
+#: is actually seen (a yellow ball that marks and vanishes — the old "recipe card" named
+#: a thing that does not exist), the protocol (remember, pick, find the bowl somewhere
+#: on the counter, tip), and the rule the predicate enforces (the other condiment stays).
+#: `get_language_instruction` hands out INSTRUCTIONS[0]; the paraphrases are for
+#: language robustness in a dataset.
 INSTRUCTIONS = (
-    "Season the dish with the condiment the recipe card showed, then hold it "
-    "tipped over the bowl.",
+    "At the start a yellow ball hovers over a condiment on the counter and then "
+    "disappears. Remember which condiment it marked, pick that condiment up, find the "
+    "bowl standing somewhere on this counter, and hold the condiment tipped over the bowl "
+    "to season the dish. Leave the other condiment where it is.",
+    "A yellow ball briefly marks a condiment, then vanishes. Take the condiment it "
+    "marked, carry it to the bowl on the counter and tip it over the bowl. Do not touch "
+    "the other condiment.",
+    "Season the dish in the bowl with the condiment the yellow ball marked at the start: "
+    "pick it up, bring it over the bowl and hold it tipped. The other condiment stays "
+    "put.",
 )
 
 # Where the cue marker goes while it must not be seen. The constant, and the
@@ -179,7 +193,17 @@ class SeasonDishConfig:
 
     dock_wall_clear: float = float(os.environ.get("MIKASA_DOCK_WALL_CLEAR", "0.46"))
     """Least clear floor between a drawn object's dock and the room's end wall, metres.
-    **0.46 since 2026-09-06 (W30), was 0.55.** The 9 cm margin K76 added below was chosen,
+
+    **0.46 since 2026-09-06 (W30), was 0.55.** Measured 2026-09-09 for the arm-out drive
+    (the owner first asked for the bowl away from the wall, then preferred to keep the
+    layout and pull the arm in instead): the held condiment leads the drive 0.76 m ahead
+    of the base centre (3608), so nose-first with the arm out needs clear ≥ 0.86; on
+    kitchen 102 any value in 0.66–1.64 removes the pocket left of the sink (x 0.33–0.76)
+    from the bowl's regions, the bowl then draws in x 1.75–2.66 and the station pair
+    falls to its left in 72 % of draws (400 draws; 56 % at 0.46). The draw is rejection
+    sampling, uniform over whatever is allowed. `MIKASA_DOCK_WALL_CLEAR=0.9` is that
+    alternative; the default keeps the layout and the oracle handles the wall by pulling
+    the arm in (season_dish_planner, the drive stage). The 9 cm margin K76 added below was chosen,
     not measured; three geometry-selected probes (200 episodes, `runs/2026-09-06-wall`)
     put the wall's real threshold at dock x 0.53 — every failure below it is K76's
     `drive to bowl dock (after the tuck)` against `wall_left_room`, the last at 0.524,

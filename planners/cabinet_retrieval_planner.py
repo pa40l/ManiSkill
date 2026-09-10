@@ -2393,6 +2393,10 @@ def take_and_place_straight(env, planner, task, cup_p):
     descent — what the legacy stages did on every seed.
 
     Returns `(res, done)` as `take_and_place_legacy`.
+
+    Example:
+        >>> res, done = take_and_place_straight(env, planner, task, cup_p)   # doctest: +SKIP
+        >>> if done: return res                                              # doctest: +SKIP
     """
     res = -1
     # -- STAGE 2a: the torso up, the arm to the pre-grasp posture -------------------
@@ -2574,7 +2578,12 @@ def take_and_place_legacy(env, planner, task, cup_p):
     """The pre-2026-09-09 stages 2-4 (RRT reaches, the planned back-off, the hover), kept
     verbatim behind `MIKASA_RETRIEVAL_STRAIGHT=0` for A/B measurement. Returns
     `(res, done)`: `done` means the episode is over (a refusal or a miss) and `res` is
-    what `solve` returns; otherwise the caller goes on to the door stage and the settle."""
+    what `solve` returns; otherwise the caller goes on to the door stage and the settle.
+
+    Example:
+        >>> res, done = take_and_place_legacy(env, planner, task, cup_p)     # doctest: +SKIP
+        >>> if done: return res                                              # doctest: +SKIP
+    """
     res = -1
     # -- STAGE 2: side-grasp the cup off the shelf ---------------------------------
     grasped = False

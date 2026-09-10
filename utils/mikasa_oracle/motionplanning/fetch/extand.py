@@ -296,6 +296,15 @@ BASE_PLAN_MASK = [True, True, True, False] + [True] * 11
 # qpos as the arm action on every step whatever the plan says, so the mask decides
 # whether a base move plans at all, never what the arm executes.
 BASE_ONLY_PLAN_MASK = [True, True, True] + [False] * 12
+#: The arm-frozen drive's screw with base x and y ONLY (2026-09-09): with the held
+#: object swung to the side of the base, the yaw column of the Jacobian is parallel
+#: to the drive and the least-norm step spends yaw on a pure translation — the plan
+#: curves and "no convergence after 200 step(s)" (SeasonDish 3811 after the shoulder-pan
+#: swing). The differential base drives straight and `follow_moving_forward` drops the
+#: lateral part anyway, so an x/y-only plan is the motion that is executed. Only for
+#: `freeze_arm=True` drives; the default mask is untouched.
+BASE_XY_PLAN_MASK = [True, True, False] + [False] * 12
+DRIVE_XY_ONLY_WHEN_FROZEN = os.environ.get("MIKASA_DRIVE_XY_ONLY", "1") == "1"
 
 
 class MikasaPandaArmSolverV2(PandaArmMotionPlanningSolver):
@@ -776,14 +785,73 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         q = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
         return float(np.max(np.abs(np.asarray(arm_target, dtype=np.float64) - q)))
 
+    #: While set (a world xyz), the drives hold the head TOWARD this point instead of at
+    #: zero (2026-09-09, the owner: a backwards drive is acceptable if the cameras watch the
+    #: destination): the pan is the bearing to the point from the base's heading, within
+    #: the joint's range, the tilt the elevation from the head, both moved at most
+    #: HEAD_STEP per control step. The base cameras hang on the head, so this is
+    #: what keeps the bowl in the robot's own view while it drives — backwards, the head
+    #: at ±1.5 looks along the counter and the bowl comes into frame as it nears.
+    head_look_at = None
+
+    @contextlib.contextmanager
+    def look_at(self, point):
+        """`head_look_at` set to `point` for the drives inside; cleared on exit."""
+        prev = self.head_look_at
+        self.head_look_at = None if point is None else np.asarray(point, dtype=np.float64).reshape(-1)[:3].copy()
+        try:
+            yield
+        finally:
+            self.head_look_at = prev
+
+    def _head_toward(self, point, body_now):
+        """(pan, tilt) targets that turn the head toward `point`, one bounded step from
+        where the head is."""
+        try:
+            base = self.base_env.agent.base_link.pose.sp
+            heading = base.to_transformation_matrix()[:3, 0]
+            d = np.asarray(point, dtype=np.float64)[:3] - np.asarray(base.p, dtype=np.float64)[:3]
+            yaw = float(np.arctan2(heading[1], heading[0]))
+            bearing = float(np.arctan2(d[1], d[0])) - yaw
+            bearing = float(np.arctan2(np.sin(bearing), np.cos(bearing)))
+            jm = self.env_agent.robot.active_joints_map
+            p_lo, p_hi = (float(v) for v in jm["head_pan_joint"].limits.reshape(-1)[:2].tolist())
+            t_lo, t_hi = (float(v) for v in jm["head_tilt_joint"].limits.reshape(-1)[:2].tolist())
+            pan = float(np.clip(bearing, p_lo + 0.05, p_hi - 0.05))
+            head_z = float(np.asarray(base.p)[2]) + 1.25          # the head over the base, roughly
+            tilt = float(np.clip(np.arctan2(head_z - float(d[2] + base.p[2]), max(0.3, float(np.hypot(d[0], d[1])))),
+                                 t_lo + 0.05, t_hi - 0.05))
+            return self._head_step(body_now, pan, tilt)
+        except Exception:  # a double without joints; the head stays
+            return 0.0, 0.0
+
+    #: The head's target is never more than this far from where the head IS (2026-09-10):
+    #: the body channel is a delta of 0.1 rad per step and the head's PD moves ~0.039 rad
+    #: per step whatever is asked, so a target set from a ramp or snapped to zero runs
+    #: ahead of the head and the recorded action saturates at +-1 (SeasonDish 3600:
+    #: 137 of 708 steps, the look-around and the return to zero after the drive). From
+    #: the measured head with this step the action stays at ~0.9 and the head moves at
+    #: the same speed — the arm's clock, for the head.
+    HEAD_STEP = 0.09
+
+    def _head_step(self, body_now, goal_pan: float, goal_tilt: float):
+        """(pan, tilt) targets one bounded step from the measured head toward the goals."""
+        step = self.HEAD_STEP
+        pan = float(body_now[0] + np.clip(goal_pan - body_now[0], -step, step))
+        tilt = float(body_now[1] + np.clip(goal_tilt - body_now[1], -step, step))
+        return pan, tilt
+
     def _hold_targets(self, head_zero: bool = True):
         """The measured arm pose and body pose, as ABSOLUTE targets to hold; the head
         at zero when `head_zero` (the drives' convention since the fork: the head is
-        parked while the base moves)."""
+        parked while the base moves) — or toward `head_look_at` when that is set."""
         arm = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
         body = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
         if head_zero:
-            body[0] = body[1] = 0.0
+            if self.head_look_at is not None:
+                body[0], body[1] = self._head_toward(self.head_look_at, body)
+            else:
+                body[0], body[1] = self._head_step(body, 0.0, 0.0)
         return arm, body
 
     # -- the base's dropped lateral velocity (the supervisor's item 3, 2026-09-08) ----
@@ -1203,12 +1271,19 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             return [forward]
         return [(-d, True, rev_cost), forward]
 
-    def drive_plans_after_turn(self, target_pos, aim) -> bool:
+    def drive_plans_after_turn(self, target_pos, aim, qpos=None, tcp=None, view=None) -> bool:
         """Would the base screw to `target_pos` plan, with the arm frozen, from the
         posture the opening turn toward `aim` leaves? Planned from a hypothetical qpos
         (the yaw joint advanced by the turn, the hand carried round with the base);
         nothing is executed. True when it plans; a solver without the planner says True
-        (nothing to probe with)."""
+        (nothing to probe with).
+
+        `qpos` / `tcp` (2026-09-09): the arm as the caller WOULD set it before the drive —
+        SeasonDish probes a shoulder-pan swing this way — with the TCP pose that goes
+        with it (the caller's FK); defaults are the robot as it stands. `view`: when
+        given, the closing turn at the dock from the drive heading to `view` is swept
+        in the planning world too (every 10 deg, the arm frozen), so an aim whose drive
+        plans but whose closing turn would hit the wall is not offered."""
         inner = getattr(self, "planner", None)
         if inner is None or not callable(getattr(inner, "plan_screw", None)):
             return True
@@ -1220,10 +1295,11 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             if np.linalg.norm(a) < 1e-9 or np.linalg.norm(h) < 1e-9:
                 return True
             dyaw = float(np.arctan2(h[0] * a[1] - h[1] * a[0], h[0] * a[0] + h[1] * a[1]))
-            q = self.robot.get_qpos().cpu().numpy()[0].astype(np.float64).copy()
+            q = (np.asarray(qpos, dtype=np.float64).reshape(-1).copy() if qpos is not None
+                 else self.robot.get_qpos().cpu().numpy()[0].astype(np.float64).copy())
             q[2] += dyaw
             turn = sapien.Pose(q=np.array([np.cos(dyaw / 2), 0.0, 0.0, np.sin(dyaw / 2)]))
-            tcp = self.base_env.agent.tcp.pose.sp
+            tcp = tcp if tcp is not None else self.base_env.agent.tcp.pose.sp
             tcp_turned = base * turn * (base.inv() * tcp)
             delta = np.asarray(target_pos, dtype=float).reshape(-1)[:3] - base.p
             delta[2] = 0.0
@@ -1231,9 +1307,38 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
             result = inner.plan_screw(
                 mplib.Pose(p=goal.p, q=goal.q), q,
                 time_step=self.base_env.control_timestep,
-                masked_joints=BASE_ONLY_PLAN_MASK,
+                masked_joints=BASE_XY_PLAN_MASK if DRIVE_XY_ONLY_WHEN_FROZEN else BASE_ONLY_PLAN_MASK,
             )
-            return str(result.get("status")) == "Success"
+            if str(result.get("status")) != "Success":
+                return False
+            if view is None:
+                return True
+            # The closing sweep at the dock: the base parked, yaw stepped from the drive
+            # heading to the view heading the short way, the arm as given.
+            v = np.asarray(view, dtype=float).reshape(-1)[:2]
+            if np.linalg.norm(v) < 1e-9:
+                return True
+            dclose = float(np.arctan2(a[0] * v[1] - a[1] * v[0], a[0] * v[0] + a[1] * v[1]))
+            pos = np.asarray(result["position"])
+            q_dock = q.copy()
+            for i, j in enumerate(inner.move_group_joint_indices):
+                q_dock[j] = pos[-1, i]
+            world = inner.planning_world
+            # The short way first, then the long way round — as `rotate_base_z` turns.
+            for turn in (dclose, dclose - np.sign(dclose) * 2 * np.pi if abs(dclose) > 1e-6 else -2 * np.pi):
+                n = max(2, int(abs(turn) / np.radians(10.0)) + 1)
+                clear = True
+                for k in range(1, n + 1):
+                    qk = q_dock.copy()
+                    qk[2] = q_dock[2] + turn * k / n
+                    qf = inner.fold_qpos(inner.pad_move_group_qpos(qk))
+                    world.set_qpos_all(qf[inner.move_group_joint_indices])
+                    if world.is_state_colliding():
+                        clear = False
+                        break
+                if clear:
+                    return True
+            return False
         except Exception as e:  # pragma: no cover - the probe must never lose a leg
             print(f"[drive_base] aim probe raised {type(e).__name__}: {e}")
             return True
@@ -1293,13 +1398,19 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                     if len(cands) == 1 and reverse_ok and BASE_REVERSE:
                         cands = cands + self.approach_aims(target_pos, target_view_vec,
                                                            reverse_ok=True, reverse_only=True)
-                    probed = [(c, self.drive_plans_after_turn(target_pos, c[0])) for c in cands]
+                    probed = [(c, self.drive_plans_after_turn(target_pos, c[0], view=target_view_vec)) for c in cands]
                     good = [c for c, ok in probed if ok]
                     bad = [c for c, ok in probed if not ok]
                     if bad:
                         self._report("drive_base", to_trace=False, probe="aims",
                                      plans=[bool(ok) for _c, ok in probed],
                                      reverse=[bool(c[1]) for c, _ok in probed])
+                    if not good:
+                        # Nothing on offer plans: refuse WITHOUT the opening turn, so the
+                        # caller's recovery (a swing of the arm, a tuck) starts from the
+                        # posture it has, not from a wasted 90-180 deg turn (2026-09-09).
+                        self._report("drive_base", to_trace=False, probe="aims", refused="no aim plans; no turn made")
+                        return -1
                     cands = good + bad
                 res, chosen = -1, None
                 for i, (aim, rev, cost) in enumerate(cands):
@@ -1354,7 +1465,8 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
         """
         if self.truncated:
             return self._guard.last_step
-        mask = BASE_ONLY_PLAN_MASK if freeze_arm else BASE_PLAN_MASK
+        mask = ((BASE_XY_PLAN_MASK if DRIVE_XY_ONLY_WHEN_FROZEN else BASE_ONLY_PLAN_MASK)
+                if freeze_arm else BASE_PLAN_MASK)
         tcp_pose = self.base_env.agent.tcp.pose.sp
         base_link_pose = self.base_env.agent.base_link.pose.sp
         delta = new_base_pose - base_link_pose.p
@@ -2614,10 +2726,10 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
 
             assert self.control_mode in self.COMPOSE_MODES, self.control_mode
 
-            body_action = np.zeros_like(
-                self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
-            )
+            body_now = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
+            body_action = np.zeros_like(body_now)
             body_action[2] = qpos_dict[f"scene-0-{self.robot.name}_torso_lift_joint"]
+            body_action[0], body_action[1] = self._head_step(body_now, 0.0, 0.0)
 
             base_direction = (
                 self.env_agent.base_link.pose.sp.to_transformation_matrix()[:3, 0]
@@ -2712,13 +2824,12 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                     print(f"Reached max refining steps ({self.max_refine_steps})!")
                     break
 
-                body_action = np.zeros_like(
-                    self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy()
-                )
+                body_now = self.env_agent.controller.controllers["body"].qpos[0].cpu().numpy().astype(np.float64)
+                body_action = np.zeros_like(body_now)
                 body_action[2] = qpos_dict_final[
                     f"scene-0-{self.robot.name}_torso_lift_joint"
                 ]
-                body_action[0] = body_action[1] = 0.0
+                body_action[0], body_action[1] = self._head_step(body_now, 0.0, 0.0)
 
                 base_action = np.array([0.0, 0.0])
 
@@ -3163,6 +3274,44 @@ class MikasaFetchSolver(MikasaPandaArmSapienSolver):
                 ok = info.get("success", False) if isinstance(info, dict) else False
                 if bool(ok[0] if hasattr(ok, "__len__") else ok):
                     break
+        return out
+
+    def turn_head(self, pan: float | None = None, tilt: float | None = None,
+                  max_steps: int = 120, settle_tol: float = 0.03):
+        """Turn the head to `pan` / `tilt` (radians, absolute; None keeps the joint) with the
+        arm and the base held — the body controller's own channels, one bounded step from
+        the measured head per control step (`HEAD_STEP`, inside the delta clip), until
+        within `settle_tol` or `max_steps`. Returns the last 5-tuple, or -1 when nothing
+        had to move. The head is not
+        in the arm's planning chain, so `plan_joints` cannot move it (2026-09-09,
+        SeasonDish's look-around: its joint line came back one knot long)."""
+        if self.truncated:
+            return self._guard.last_step
+        body_ctrl = self.env_agent.controller.controllers["body"]
+        names = list(body_ctrl.config.joint_names)
+        body = body_ctrl.qpos[0].cpu().numpy().astype(np.float64)
+        goal = body.copy()
+        if pan is not None and "head_pan_joint" in names:
+            goal[names.index("head_pan_joint")] = float(pan)
+        if tilt is not None and "head_tilt_joint" in names:
+            goal[names.index("head_tilt_joint")] = float(tilt)
+        if float(np.max(np.abs(goal - body))) < 1e-4:
+            return -1
+        arm = self.env_agent.controller.controllers["arm"].qpos[0].cpu().numpy().astype(np.float64)
+        out = -1
+        # One bounded step from the MEASURED head each control step (`_head_step`): the
+        # head moves at its own pace (~0.039 rad per step) and the recorded action stays
+        # off the clip; a ramp from the start pose ran ahead of it and saturated.
+        for _ in range(int(max_steps)):
+            now = body_ctrl.qpos[0].cpu().numpy().astype(np.float64)
+            if float(np.max(np.abs(goal[:2] - now[:2]))) < settle_tol and float(abs(goal[2] - now[2])) < settle_tol:
+                break
+            target = now.copy()
+            target[0], target[1] = self._head_step(now, float(goal[0]), float(goal[1]))
+            target[2] = float(goal[2])
+            out = self._step(self._compose(arm, target, np.array([0.0, 0.0])))
+            if self._stopped_by_horizon("turn_head"):
+                break
         return out
 
     def idle_steps(self, t=20):

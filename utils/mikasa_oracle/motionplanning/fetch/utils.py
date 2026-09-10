@@ -996,8 +996,16 @@ class SapienPlannerV2(SapienPlanner):
             # twist left"). Collisions and limits still fail the arrival step.
             stalled = np.linalg.norm(delta_twist) < 1e-4 and not flag
             accepted_slack = False
+            # Eligible for the one-knot-short arrival when the twist left is within the
+            # slack OR within the caller's own tolerance (2026-09-09: SeasonDish's lift
+            # met the roll window with 0.012 of the twist left and a 3 cm tolerance — the
+            # knot before was 1.2 cm short of a target the caller had 3 cm of room on,
+            # and it was refused for the 0.01 gate alone).
+            slack_gate = SCREW_ARRIVAL_SLACK
+            if goal_tolerance is not None:
+                slack_gate = max(slack_gate, float(goal_tolerance[0]))
             if (collide or not within_joint_limit) and not stalled and len(path) >= 2 \
-                    and float(np.linalg.norm(omega)) <= SCREW_ARRIVAL_SLACK:
+                    and float(np.linalg.norm(omega)) <= slack_gate:
                 # SeasonDish 1957 (2026-09-06): the standoff->grasp screw was refused
                 # `forearm_roll_link <-> counter` with **0.005 of the twist left** — the
                 # last hair of a 10 cm descent — and the RRT that replaced a straight

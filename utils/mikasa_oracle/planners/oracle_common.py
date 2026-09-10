@@ -1017,9 +1017,129 @@ class _Tee(io.TextIOBase):
 
 def roll_room(planner):
     """`planner.roll_room()` — the roll joints' planning limits widened to the simulator's
-    for the plans inside — or a no-op for a solver (a test double) without it."""
+    for the plans inside — or a no-op for a solver (a test double) without it.
+
+    Open it only for a motion that IS a roll, and only when every plan after it is
+    under it too: a leg planned inside the room can leave a roll joint outside the
+    window, and every later plan then clips the start qpos back into it, so the
+    model's forward kinematics disagree with the simulator (SeasonDish 3811,
+    2026-09-09: 0.2 m and 4 deg apart, and the next drive chased an unreachable goal).
+
+    Example:
+        >>> with roll_room(planner):                       # doctest: +SKIP
+        ...     res = common.arm_move(env, planner, pour_pose, who=WHO, stage="pour")
+    """
     ctx = getattr(planner, "roll_room", None)
     return ctx() if callable(ctx) else contextlib.nullcontext()
+
+
+def head_look_at(planner, point):
+    """`planner.look_at(point)` — the drives inside hold the head toward `point` (world
+    xyz) — or a no-op for a solver (a test double) without it.
+
+    Example:
+        >>> with head_look_at(planner, bowl_p):                                    # doctest: +SKIP
+        ...     res = planner.drive_base(target_pos=dock_xyz, target_view_vec=face, freeze_arm=True)
+    """
+    ctx = getattr(planner, "look_at", None)
+    return ctx(point) if callable(ctx) else contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def screw_tolerance(planner, tol):
+    """The screw's arrival gate (`ARM_SCREW_GOAL_TOLERANCE`, metres and radians) set on
+    THIS solver instance for the plans inside — `static_manipulation` and the K61 probe
+    both read the attribute, so the probe still mirrors the execution. For a leg whose
+    target has slack by construction: SeasonDish's lift (2026-09-09, 3811) only has to
+    clear the neighbour, and its screw was refused with the knot before the stop 2.5 cm
+    short of a target 3 cm above the floor. Restored on exit.
+
+    Args:
+        tol: `(metres, radians)` — the arrival gate for the plans inside.
+
+    Example:
+        >>> with screw_tolerance(planner, (0.03, 0.10)):    # doctest: +SKIP
+        ...     ok = screw_plans(planner, rung_pose, disable_lift_joint=True)
+    """
+    had = "ARM_SCREW_GOAL_TOLERANCE" in vars(planner)
+    saved = vars(planner).get("ARM_SCREW_GOAL_TOLERANCE")
+    try:
+        planner.ARM_SCREW_GOAL_TOLERANCE = tuple(tol)
+    except Exception:  # a double that forbids attributes
+        yield
+        return
+    try:
+        yield
+    finally:
+        if had:
+            planner.ARM_SCREW_GOAL_TOLERANCE = saved
+        else:
+            try:
+                del planner.ARM_SCREW_GOAL_TOLERANCE
+            except AttributeError:
+                pass
+
+
+@contextlib.contextmanager
+def allow_held_contacts(env, planner, stems, who: str, stage: str):
+    """Allow, in the planning world's collision matrix, the contacts a HELD object makes at
+    the start with non-robot objects — the counter it still stands on — for the plans
+    inside; removed on exit.
+
+    mplib will not plan out of a start it calls colliding: the RRT prints `Invalid start
+    state!`, perturbs the start and answers with a two-knot path (SeasonDish 3811,
+    2026-09-09: the bottle, just grasped, rests on the counter in the model; the lift's
+    four RRT draws all started that way and the executed one twisted the forearm 0.7 rad
+    while the torso rose, ripping the bottle out of the pinch). The contact is real and
+    harmless — the object is in the hand and about to leave the surface — the same
+    reasoning as `hold_object_in_planner(extra_touch=)` for the object against the arm.
+    Pairs are found by asking the planning world what collides NOW, so nothing is allowed
+    that the start does not already touch; robot-link pairs are left alone.
+
+    Args:
+        stems: substrings naming the held object(s) in the planning world (e.g. "shaker").
+
+    Yields:
+        The pairs allowed, as `(name_a, name_b)` — empty when the solver is a double
+        or nothing collides at the start.
+
+    Example:
+        >>> with allow_held_contacts(env, planner, ("shaker",), who=WHO, stage="lift") as pairs:  # doctest: +SKIP
+        ...     res = common.arm_move(env, planner, lift_pose, who=WHO, stage="lift")
+    """
+    inner = getattr(planner, "planner", None)
+    world = getattr(inner, "planning_world", None)
+    if world is None or not callable(getattr(world, "check_collision", None)):
+        yield []
+        return
+    pairs = []
+    try:
+        inner.update_from_simulation()
+        for c in world.check_collision():
+            n1, n2 = str(c.link_name1), str(c.link_name2)
+            if ("fetch" in n1) or ("fetch" in n2):
+                continue
+            if any(s in n1 or s in n2 for s in stems):
+                pairs.append((n1, n2))
+        acm = world.get_allowed_collision_matrix()
+        for n1, n2 in pairs:
+            acm.set_entry(n1, n2, True)
+    except Exception as exc:  # the probe must never lose a leg
+        say(env, who, f"{stage}: could not read the model's contacts", why=f"{type(exc).__name__}: {exc}"[:120])
+        pairs = []
+    if pairs:
+        say(env, who, f"{stage}: the held object touches the model's world at the start; allowing that contact",
+            pairs=[f"{a.split('_', 1)[-1]}<->{b.split('_', 1)[-1]}" for a, b in pairs])
+    try:
+        yield pairs
+    finally:
+        if pairs:
+            try:
+                acm = world.get_allowed_collision_matrix()
+                for n1, n2 in pairs:
+                    acm.remove_entry(n1, n2)
+            except Exception:
+                pass
 
 
 def screw_plans(planner, target_tcp_pose, *, disable_lift_joint: bool = False, want_result: bool = False):
@@ -1475,6 +1595,7 @@ def carry_pose(
     env, planner, task, obj, who: str = "oracle", *, ahead: float = 0.25, after: str | None = None,
     yaws_deg=CARRY_YAWS_DEG, lifts_m=CARRY_LIFTS_M,
     upright: bool = False, legs: int = 1, max_knots=None, knot_draws: int = 1,
+    knot_refuse: bool = False, by_line: bool = False,
 ):
     """Bring the held object into a carry pose over the base before driving (K52/D12).
 
@@ -1524,6 +1645,12 @@ def carry_pose(
         legs: above 1 the tuck is broken into short hops via `move_via`.
         max_knots: the K58 redraw knife — forwarded to the solver.
         knot_draws: the K58 redraw knife — forwarded to the solver.
+        knot_refuse: with `max_knots`, refuse an RRT answer over the cap instead of
+            executing the shortest draw (2026-09-09: a straight-only tuck pass).
+        by_line: ask the solver for a joint LINE to the nearest IK solution first
+            (`static_manipulation(by_line=True)`): the tuck as one monotone joint
+            motion, no roll winding, where the screw to the same pose wound the
+            upperarm and forearm rolls by +2 rad each (SeasonDish, the yaw-90 carry).
 
     Example:
         >>> res = carry_pose(env, planner, task, task.cup, who="burner_planner")  # doctest: +SKIP
@@ -1626,7 +1753,9 @@ def carry_pose(
                              max_knots=max_knots, knot_draws=knot_draws)
                     if legs > 1
                     else planner.static_manipulation(
-                        target, disable_lift_joint=True, **_knot_kw(max_knots, knot_draws)
+                        target, disable_lift_joint=True,
+                        **_knot_kw(max_knots, knot_draws, knot_refuse),
+                        **({"by_line": True} if by_line else {}),
                     )
                 )
                 if res != -1 and stopped_by_horizon(planner):
