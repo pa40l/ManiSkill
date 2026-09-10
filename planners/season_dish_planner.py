@@ -546,6 +546,10 @@ finding that perturbing this planner's path reshuffles rather than reduces. The 
 real; inflating the obstacle is not the answer to it."""
 
 GRASP_REREAD_REPORT_M = 0.02
+GRASP_NUDGE_GIVE_UP_M = float(os.environ.get("MIKASA_NUDGE_GIVE_UP", "0.03"))
+"""Displacement of the target, metres, at which the oracle STOPS instead of re-aiming —
+the task's `nudge_tol` seen from this side (the owner, 2026-09-10). Below it the re-read
+still corrects the grasp for a millimetre-scale shift, which is what it was built for."""
 """Object drift, in metres, past which the ladder says out loud that it is re-aiming.
 
 Below this the re-read is a no-op worth no trace line; above it the object was knocked
@@ -1458,6 +1462,16 @@ def _roll_reach(planner, result) -> float:
         return 0.0
 
 
+def knocked_miss(env, planner, res=None):
+    """Book a knocked target as a MISS, not as a refused plan: the robot moved and lost the
+    episode, which is what `classify_result` means by `missed` (a `-1` books `no plan`).
+    Returns the last real 5-tuple when there is one, otherwise one idle step's."""
+    if res is not None and res != -1:
+        return res
+    stepped = planner.idle_steps(t=1)
+    return stepped if stepped != -1 else fail(env, "the target was knocked")
+
+
 def _knot_kw_straight(planner) -> dict:
     """`static_manipulation` kwargs that refuse any RRT answer (line / screw only), or
     nothing for a solver (a test double) without the knot cap."""
@@ -1657,7 +1671,9 @@ def _solve(
         approach_deg=round(math.degrees(math.atan2(float(ee_direction[1]), float(ee_direction[0]))), 1))
 
     def reaim_from_live(closing_sign: float):
-        """The yaw ladder's live re-read (K63), one block earlier. None if unreadable."""
+        """The yaw ladder's live re-read (K63), one block earlier. None if unreadable;
+        `"knocked"` when the target has been shoved past `GRASP_NUDGE_GIVE_UP_M` — the
+        caller then books the miss rather than retrying (the owner, 2026-09-10)."""
         live = target.get_first_collision_mesh(to_world_frame=True)
         if live is None:
             return None
@@ -1665,6 +1681,9 @@ def _solve(
         moved = float(np.linalg.norm(
             np.asarray(obb_now.center_mass, dtype=np.float64)[:2]
             - np.asarray(obb.center_mass, dtype=np.float64)[:2]))
+        if moved > GRASP_NUDGE_GIVE_UP_M:
+            say(env, "missed: the target was knocked", moved_cm=round(moved * 100, 1))
+            return "knocked"
         if moved > GRASP_REREAD_REPORT_M:
             say(env, "the object moved during an earlier attempt; re-aiming the retry",
                 moved_cm=round(moved * 100, 1))
@@ -1690,6 +1709,8 @@ def _solve(
         planner.planner.update_from_simulation()
         if REREAD_BEFORE_RETRY:
             aimed = reaim_from_live(1.0)
+            if aimed == "knocked":
+                return knocked_miss(env, planner, attempt_res[-1] if attempt_res else None)
             if aimed is not None:
                 grasp, reach = aimed
         with common.capture_refusal("stove") as stove_cap:
@@ -1704,6 +1725,8 @@ def _solve(
         planner.open_gripper()
         planner.planner.update_from_simulation()
         aimed = reaim_from_live(-1.0) if REREAD_BEFORE_RETRY else None
+        if aimed == "knocked":
+            return knocked_miss(env, planner, attempt_res[-1] if attempt_res else None)
         grasp, reach = aimed if aimed is not None else raise_grasp_to(
             *grasp_geometry(task, obb, ee_direction, -target_closing, grasp_info), z_grasp)
         with common.capture_refusal("stove") as stove_cap:
@@ -1738,6 +1761,8 @@ def _solve(
                     pad=GRASP_KEEPOUT_PAD)
                 for sign, name in ((1.0, "as seeded"), (-1.0, "flipped")):
                     aimed = reaim_from_live(sign) if REREAD_BEFORE_RETRY else None
+                    if aimed == "knocked":
+                        return knocked_miss(env, planner, attempt_res[-1] if attempt_res else None)
                     g_try, r_try = aimed if aimed is not None else raise_grasp_to(
                         *grasp_geometry(task, obb, ee_direction, sign * target_closing, grasp_info), z_grasp)
                     say(env, "grasp under the shipped pad", closing=name)
@@ -1789,6 +1814,15 @@ def _solve(
                 centre_xy = np.asarray(obb_now.center_mass, dtype=np.float64)[:2]
                 moved = float(np.linalg.norm(
                     centre_xy - np.asarray(obb.center_mass, dtype=np.float64)[:2]))
+                if moved > GRASP_NUDGE_GIVE_UP_M:
+                    # The owner, 2026-09-10: a knocked condiment is a lost episode, and
+                    # the oracle must not spend the horizon recovering from it. The task
+                    # agrees — `condiment_nudged` latches at `cfg.nudge_tol` — so the
+                    # re-aimed attempts below could not win anyway; they cost four grasp
+                    # legs and, on 3881, the episode.
+                    say(env, "missed: the target was knocked", moved_cm=round(moved * 100, 1),
+                        centre=[round(float(v), 3) for v in centre_xy])
+                    return knocked_miss(env, planner, res)
                 if moved > GRASP_REREAD_REPORT_M:
                     say(env, "the object has moved since the first grasp; re-aiming",
                         moved_cm=round(moved * 100, 1),

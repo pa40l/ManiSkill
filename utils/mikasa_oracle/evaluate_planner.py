@@ -436,6 +436,17 @@ def parse_args(argv=None):
         "each env's own default: a random draw for MyRoboCasa-v1, kitchen 102 "
         "(scene_idx=0) for the memory tasks",
     )
+    p.add_argument(
+        "--control-freq",
+        type=int,
+        default=None,
+        help="the env's control frequency, Hz (default: the task's own 20). The VLA "
+             "dataset is collected at 10 (the owner, 2026-09-10), and a recording is "
+             "honest only if the env ran at the rate the data claims: an action is a "
+             "delta per control step, so the same action at 10 Hz moves the arm half as "
+             "fast. Passed through `sim_config`; the plans are TOPP-timed with "
+             "`control_timestep`, so they re-time themselves.",
+    )
     p.add_argument("--render-mode", default="rgb_array", choices=["rgb_array", "human"])
     p.add_argument(
         "--obs-mode",
@@ -619,6 +630,8 @@ def run_sweep(args, *, make_env=gym.make, recorder_cls=RecordEpisode) -> SweepRe
         make_kwargs["human_render_camera_configs"] = dict(
             width=args.render_size, height=args.render_size
         )
+    if args.control_freq is not None:
+        make_kwargs["sim_config"] = dict(control_freq=int(args.control_freq))
 
     env = make_env(args.scene, **make_kwargs)
     recorder = None

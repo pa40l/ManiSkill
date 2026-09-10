@@ -318,6 +318,21 @@ class SeasonDishConfig:
     "Body axis treated as 'up' when upright. Settle it with diagnose_task --task season."
 
     grasp_min_force: float = 0.5
+    nudge_tol: float = float(os.environ.get("MIKASA_NUDGE_TOL", "0.03"))
+    """How far the TARGET condiment may be shoved before the episode is lost, metres.
+
+    The owner, 2026-09-10: *«если приправа сбивается, то считай эпизод провальным, не нужно
+    пытаться поднимать и тратить время»*. Measured against the counted alternative — the
+    approach that knocks the target costs the oracle four re-aimed grasp attempts and, on
+    seed 3881, the episode anyway. Latched as `condiment_nudged`, and only while the
+    target has never been in the gripper: once it is held, moving it IS the task, and a
+    slip after that is already covered by `condiment_fell` (tilt or drop).
+
+    0.03 against a settling floor of **0.4 mm**: over 200 episodes the shaker's own drift
+    through the cue phase is at most 0.02 cm and the bottle's 0.04 cm (the condiments are
+    dropped `spawn_clearance` onto a flat top and stay). The knock that lost 3881 was
+    6.5 cm."""
+
     distractor_move_tol: float = 0.10
     "How far the wrong condiment may drift before the episode is void."
 
@@ -357,6 +372,7 @@ class SeasonDishConfig:
         assert self.dock_wall_clear >= 0.0 and self.station_dock_wall_clear >= 0.0
         assert self.placement_draw in ("joint", "pair-first"), self.placement_draw
         assert self.distractor_move_tol > 0 and self.grasp_min_force > 0
+        assert self.nudge_tol > 0, self.nudge_tol
         assert self.marker_radius > 0 and self.marker_height > 0
 
 
@@ -788,6 +804,8 @@ class SeasonDishTask(BaseEnv):
         self._shaker_home = torch.zeros((n, 3), dtype=torch.float32, device=dev)
         self._bottle_home = torch.zeros((n, 3), dtype=torch.float32, device=dev)
         self.condiment_fell = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.condiment_nudged = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._target_held = torch.zeros(n, dtype=torch.bool, device=dev)
         self._marker_home = torch.zeros((n, 3), dtype=torch.float32, device=dev)
         # The bowl where it comes to rest, captured at `cue_steps` (K73).
         self._bowl_settled = torch.zeros((n, 2), dtype=torch.float32, device=dev)
@@ -911,6 +929,8 @@ class SeasonDishTask(BaseEnv):
             self._shaker_home[env_idx] = shaker_pos
             self._bottle_home[env_idx] = bottle_pos
             self.condiment_fell[env_idx] = False
+            self.condiment_nudged[env_idx] = False
+            self._target_held[env_idx] = False
 
             marker_pos = target_pos + torch.tensor([0.0, 0.0, self.cfg.marker_height])
             self._marker_home[env_idx] = marker_pos
@@ -1188,7 +1208,20 @@ class SeasonDishTask(BaseEnv):
             | (bottle_p[:, 2] < self._bottle_home[:, 2] - self.cfg.fell_drop_m)
         self.condiment_fell = self.condiment_fell | (fell_now & (self.elapsed_steps > 0))
 
-        pour_now = grasp_target & over_bowl & height_ok & tilted & distractor_ok & ~self.condiment_fell
+        # --- a knocked target: shoved past `nudge_tol` before it was ever in the gripper
+        # (the owner, 2026-09-10). Once it has been held, moving it IS the task and a slip
+        # after that is `condiment_fell`'s business — so the clause is gated on
+        # `_target_held`, which also makes it immune to a flickering grasp flag on a
+        # carried object. Latched, like the other two.
+        target_home = torch.where(m1, self._shaker_home, self._bottle_home)
+        target_moved = torch.linalg.norm(target_p[:, :2] - target_home[:, :2], dim=1)
+        self._target_held = self._target_held | grasp_target
+        self.condiment_nudged = self.condiment_nudged | (
+            (target_moved > self.cfg.nudge_tol) & ~self._target_held & (self.elapsed_steps > 0)
+        )
+
+        pour_now = (grasp_target & over_bowl & height_ok & tilted & distractor_ok
+                    & ~self.condiment_fell & ~self.condiment_nudged)
 
         # --- the hold counter, idempotent within a step ----------------------
         # evaluate() mutates, and three call sites invoke it out of band:
@@ -1206,7 +1239,8 @@ class SeasonDishTask(BaseEnv):
         self._pour_last_eval_step = torch.where(advance, step, self._pour_last_eval_step)
 
         earliest = self.cfg.cue_steps + self.cfg.delay_steps
-        success = (self.pour_hold >= self.cfg.hold_steps) & (self.elapsed_steps >= earliest) & ~self.condiment_fell
+        success = ((self.pour_hold >= self.cfg.hold_steps) & (self.elapsed_steps >= earliest)
+                   & ~self.condiment_fell & ~self.condiment_nudged)
 
         # A brace literal, not dict(success=...): the convention check is
         # `"dict(success=" in src.replace(" ", "")` (test_task_conventions.py:161),
@@ -1225,6 +1259,8 @@ class SeasonDishTask(BaseEnv):
             "grasp_distractor": grasp_distractor,
             "is_grasping_shaker": grasp_shaker,
             "is_grasping_bottle": grasp_bottle,
+            "condiment_nudged": self.condiment_nudged,
+            "target_moved": target_moved,
             "distractor_ok": distractor_ok,
             "distractor_moved": distractor_moved,
             "condiment_fell": self.condiment_fell,
@@ -1301,6 +1337,8 @@ class SeasonDishTask(BaseEnv):
         state["pour_hold"] = self.pour_hold.clone()
         state["pour_last_eval_step"] = self._pour_last_eval_step.clone()
         state["distractor_home"] = self._distractor_home.clone()
+        state["condiment_nudged"] = self.condiment_nudged.clone()
+        state["target_held"] = self._target_held.clone()
         state["shaker_home"] = self._shaker_home.clone()
         state["bottle_home"] = self._bottle_home.clone()
         state["condiment_fell"] = self.condiment_fell.clone()
@@ -1330,6 +1368,8 @@ class SeasonDishTask(BaseEnv):
             "shaker_home": "_shaker_home",
             "bottle_home": "_bottle_home",
             "condiment_fell": "condiment_fell",
+            "condiment_nudged": "condiment_nudged",
+            "target_held": "_target_held",
         }
         for key, attr in restore.items():
             if key in state:

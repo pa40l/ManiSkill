@@ -142,6 +142,14 @@ GRASP_TOUCH_RETRY = os.environ.get("MIKASA_GRASP_TOUCH_RETRY", "1") != "0"
 
 #: TOPP limits the solver plans the ARM under when the env is in `pd_joint_delta_pos`
 #: (`default_planner_factory`), for a probe: 0 (the default) keeps the solver's own.
+#: Control step at or above which the clock counts as SLOW and plans are timed down (see
+#: `default_planner_factory`): 0.09 s catches the dataset's 10 Hz and leaves the tasks' own
+#: 20 Hz (0.05 s) exactly as measured.
+SLOW_CLOCK_TIMESTEP = float(os.environ.get("MIKASA_SLOW_CLOCK_TIMESTEP", "0.09"))
+SLOW_CLOCK_VEL_LIMIT = float(os.environ.get("MIKASA_SLOW_CLOCK_VEL", "0.45"))
+#: `MikasaFetchSolver`'s own default, for the cap above to compare against.
+SOLVER_DEFAULT_VEL_LIMIT = 0.9
+
 DELTA_JOINT_VEL_LIMIT = float(os.environ.get("MIKASA_DELTA_VEL", "0"))
 DELTA_JOINT_ACC_LIMIT = float(os.environ.get("MIKASA_DELTA_ACC", "0.9"))
 
@@ -182,6 +190,26 @@ def default_planner_factory(env, debug: bool, vis: bool, *, max_refine_steps: in
         joint_vel_limits = DELTA_JOINT_VEL_LIMIT
         if joint_acc_limits is None:
             joint_acc_limits = DELTA_JOINT_ACC_LIMIT
+    if getattr(env.unwrapped, "control_mode", None) == "pd_joint_delta_pos" \
+            and float(getattr(env.unwrapped, "control_timestep", 0.05)) >= SLOW_CLOCK_TIMESTEP:
+        # A SLOW control clock — the VLA dataset's 10 Hz (`evaluate_planner --control-freq
+        # 10`). An action is a delta per control STEP, bounded at 0.1 rad however long the
+        # step lasts, so a path timed for the solver's default 0.9 asks the channel for
+        # more than it can carry and the recorded actions sit at the clip. Measured
+        # 2026-09-10 at 10 Hz, arm clip fraction / episode steps:
+        #   Retrieval 1100     0.9 -> 0.107      0.6 -> 0.000 (327)   0.45 -> 0.000 (341)
+        #   SeasonDish 3600    0.9 -> 0.200      0.6 -> 0.005 (436)   0.45 -> 0.000 (490)
+        #   CabinetSearch 2367 0.9 -> 0.028      0.6 -> 0.028 (1850)  0.45 -> 0.000 (2012)
+        # At 0.6 the clipped steps were genuine motion — the plan asking 0.1 rad where the
+        # PD delivers 0.063 — so the cap is 0.45: every task clips nothing and the
+        # episodes grow 4-9 %. A CAP rather than a
+        # default, because the oracles set the limit themselves (SeasonDish passes 0.9 —
+        # `JOINT_LIMIT_SCALE` — and kept clipping a fifth of its steps until this capped
+        # it). Keyed on the clock, not on the mode, so the tasks' own 20 Hz (0.05 s,
+        # 0.038 rad/step, no clip) is untouched — and the 2026-09-09 finding above (0.6 at
+        # 20 Hz put Retrieval's stage ends on joint limits) is about a step half as long.
+        joint_vel_limits = min(SOLVER_DEFAULT_VEL_LIMIT if joint_vel_limits is None
+                               else float(joint_vel_limits), SLOW_CLOCK_VEL_LIMIT)
     return MikasaFetchSolver(
         env,
         debug=debug,
